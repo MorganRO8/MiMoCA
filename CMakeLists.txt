@@ -6,6 +6,7 @@ target_compile_features(mimoca PRIVATE cxx_std_20)
 
 if(MSVC)
   target_compile_options(mimoca PRIVATE /W4 /permissive-)
+  target_link_libraries(mimoca PRIVATE sapi ole32)
 else()
   target_compile_options(mimoca PRIVATE -Wall -Wextra -Wpedantic)
 endif()
