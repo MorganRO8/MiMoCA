@@ -6,6 +6,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <algorithm>
+#include <cctype>
 #include <vector>
 
 #ifdef _WIN32
@@ -91,6 +93,11 @@ struct Recipe {
 struct RecipeState {
     Recipe recipe;
     size_t current_step_index;
+};
+
+struct TranscriptEvent {
+    std::string text;
+    bool is_final;
 };
 
 void Log(const std::string& message);
@@ -277,6 +284,31 @@ bool ExtractJsonFieldBool(const std::string& json, const std::string& field, boo
         return false;
     }
     return default_value;
+}
+
+std::string ToLower(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text;
+}
+
+bool ContainsText(const std::string& haystack, const std::string& needle) {
+    return haystack.find(needle) != std::string::npos;
+}
+
+std::string Trim(const std::string& text) {
+    size_t start = 0;
+    while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start])) != 0) {
+        ++start;
+    }
+
+    size_t end = text.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+        --end;
+    }
+
+    return text.substr(start, end - start);
 }
 
 std::string SerializeTurnContext(const TurnContext& tc) {
@@ -680,18 +712,19 @@ void PrintPlannerResponse(const PlannerResponse& response) {
 PlannerResponse LocalRecipeFallback(const RecipeState& state, const std::string& command) {
     const RecipeStep* current = GetCurrentStep(state);
     const RecipeStep* next = GetNextStep(state);
+    const std::string normalized = ToLower(command);
 
     PlannerResponse response{};
     response.speak = true;
     response.interruptible = true;
     response.advance_step = false;
 
-    if (command == "current") {
+    if (ContainsText(normalized, "current")) {
         response.assistant_text = current != nullptr ? "Current step: " + current->instruction : "No current step available.";
         return response;
     }
 
-    if (command == "next") {
+    if (ContainsText(normalized, "next")) {
         if (next != nullptr) {
             response.assistant_text = "Next instruction: " + next->instruction;
             response.advance_step = true;
@@ -704,6 +737,48 @@ PlannerResponse LocalRecipeFallback(const RecipeState& state, const std::string&
     response.assistant_text = "Say 'current' or 'next'.";
     return response;
 }
+
+std::string InferGestureLabelFromUtterance(const std::string& utterance) {
+    const std::string normalized = ToLower(utterance);
+    if (ContainsText(normalized, "next")) {
+        return "next";
+    }
+    if (ContainsText(normalized, "repeat")) {
+        return "repeat";
+    }
+    return "none";
+}
+
+class SpeechInputAdapter {
+   public:
+    virtual ~SpeechInputAdapter() = default;
+    virtual bool TryConsumeConsoleLine(const std::string& line, TranscriptEvent& out_event) = 0;
+    virtual std::string Name() const = 0;
+};
+
+class MockTranscriptInputAdapter final : public SpeechInputAdapter {
+   public:
+    bool TryConsumeConsoleLine(const std::string& line, TranscriptEvent& out_event) override {
+        const std::string partial_prefix = "say-partial ";
+        const std::string final_prefix = "say-final ";
+
+        if (line.rfind(partial_prefix, 0) == 0) {
+            out_event = TranscriptEvent{Trim(line.substr(partial_prefix.size())), false};
+            return true;
+        }
+
+        if (line.rfind(final_prefix, 0) == 0) {
+            out_event = TranscriptEvent{Trim(line.substr(final_prefix.size())), true};
+            return true;
+        }
+
+        return false;
+    }
+
+    std::string Name() const override {
+        return "mock-transcript-stdin";
+    }
+};
 
 }  // namespace
 
@@ -733,10 +808,17 @@ int main() {
     }
 
     TtsController tts;
+    MockTranscriptInputAdapter speech_input;
+    Log("Speech input adapter: " + speech_input.Name());
 
-    Log("Type 'current', 'next', 'stop' (cancel speech), or 'exit'.");
+    Log("Type 'current', 'next', 'stop' (cancel speech), 'say-partial <text>', 'say-final <text>', or 'exit'.");
     std::string line;
     while (std::getline(std::cin, line)) {
+        line = Trim(line);
+        if (line.empty()) {
+            continue;
+        }
+
         if (line == "exit") {
             break;
         }
@@ -746,21 +828,41 @@ int main() {
             continue;
         }
 
-        if (line != "current" && line != "next") {
-            Log("Unknown command. Use: current | next | stop | exit");
+        std::string utterance;
+        std::string command = line;
+        TranscriptEvent transcript_event{};
+        if (speech_input.TryConsumeConsoleLine(line, transcript_event)) {
+            if (transcript_event.text.empty()) {
+                Log("Speech event ignored: empty transcript.");
+                continue;
+            }
+
+            if (transcript_event.is_final) {
+                utterance = transcript_event.text;
+                command = utterance;
+                Log("Speech final transcript: '" + utterance + "'");
+            } else {
+                Log("Speech partial transcript: '" + transcript_event.text + "'");
+                continue;
+            }
+        } else if (line == "current") {
+            utterance = "what is the current step?";
+        } else if (line == "next") {
+            utterance = "what next?";
+        } else {
+            Log("Unknown command. Use: current | next | stop | say-partial <text> | say-final <text> | exit");
             continue;
         }
 
         PlannerResponse response{};
         if (sidecar_ok) {
-            const std::string utterance = line == "current" ? "what is the current step?" : "what next?";
-            const std::string gesture = line == "next" ? "next" : "none";
+            const std::string gesture = InferGestureLabelFromUtterance(utterance);
             if (!RequestMockPlanner("127.0.0.1", 8080, BuildTurnContext(recipe_state, utterance, gesture), response)) {
                 Log("Planner call failed; using local recipe fallback for this turn.");
-                response = LocalRecipeFallback(recipe_state, line);
+                response = LocalRecipeFallback(recipe_state, command);
             }
         } else {
-            response = LocalRecipeFallback(recipe_state, line);
+            response = LocalRecipeFallback(recipe_state, command);
         }
 
         PrintPlannerResponse(response);
