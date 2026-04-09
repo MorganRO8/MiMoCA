@@ -17,10 +17,12 @@ The C++ app now runs a tiny end-to-end path:
 1. load one recipe from `assets/recipes.json`
 2. track current step in memory
 3. health-check sidecar
-4. send turn context to `POST /plan` for `current` and `next` queries
-5. parse `PlannerResponse`
-6. speak `assistant_text` with Windows SAPI when `speak` is true
-7. advance local step if `advance_step` is true
+4. accept utterances from a minimal speech adapter boundary (`say-partial ...`, `say-final ...`) or shortcut commands (`current`, `next`)
+5. send turn context to `POST /plan` including `user_utterance`
+6. log partial/final transcript events in the app and log utterance receipt in the sidecar
+7. parse `PlannerResponse`
+8. speak `assistant_text` with Windows SAPI when `speak` is true
+9. advance local step if `advance_step` is true
 
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
 
@@ -52,6 +54,8 @@ The sidecar listens on `http://127.0.0.1:8080`.
 On startup, the app loads the sample recipe and then accepts these commands:
 - `current` → ask planner for current step
 - `next` → ask planner for next instruction (and advance if available)
+- `say-partial <text>` → emit a mock partial transcript event (logged only)
+- `say-final <text>` → emit a mock final transcript event and run a planner turn with that utterance
 - `stop` → cancel current TTS playback (temporary manual interruption control)
 - `exit` → quit
 
@@ -95,6 +99,7 @@ Expected: deterministic mock `PlannerResponse` JSON payload that can request ste
 ## Notes
 
 - No real model integrations are included yet.
+- Speech input is currently a mock transcript adapter over stdin (`say-partial` / `say-final`), intentionally separated so it can be replaced with a Windows microphone-backed adapter later without changing planner wiring.
 - TTS interruption is currently manual via `stop`; microphone-driven auto interruption is not wired yet.
 - The sidecar boundary is intentionally small and logged to keep iteration fast.
 - Recipe parsing is intentionally minimal and currently targets one startup recipe.

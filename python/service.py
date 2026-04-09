@@ -19,6 +19,7 @@ PORT = 8080
 
 def _deterministic_mock_planner(turn_context: dict) -> dict:
     utterance = str(turn_context.get("user_utterance", "")).strip().lower()
+    raw_utterance = str(turn_context.get("user_utterance", "")).strip()
     gesture_label = str(turn_context.get("gesture", {}).get("label", "none")).strip().lower()
     current_step_instruction = str(turn_context.get("current_step_instruction", "")).strip()
     next_step_instruction = str(turn_context.get("next_step_instruction", "")).strip()
@@ -49,7 +50,12 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
         advance_step = False
         target = "current_step"
     else:
-        assistant_text = "Mock planner ready. Ask for 'current step' or 'what next?'."
+        if raw_utterance:
+            assistant_text = (
+                f"I heard: '{raw_utterance}'. Ask for 'current step' or 'what next?'."
+            )
+        else:
+            assistant_text = "Mock planner ready. Ask for 'current step' or 'what next?'."
         advance_step = False
         target = "recipe"
 
@@ -106,6 +112,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         logging.info("serialized TurnContext request: %s", json.dumps(turn_context, separators=(",", ":")))
+        logging.info("planner received user_utterance: %s", turn_context.get("user_utterance", ""))
         planner_response = _deterministic_mock_planner(turn_context)
         logging.info("serialized PlannerResponse response: %s", json.dumps(planner_response, separators=(",", ":")))
         self._write_json(200, planner_response)
