@@ -1,8 +1,8 @@
 #include <chrono>
 #include <ctime>
 #include <iostream>
-#include <sstream>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -17,11 +17,212 @@
 
 namespace {
 
+struct Gesture {
+    std::string label;
+    double confidence;
+};
+
+struct Detection {
+    std::string label;
+    double confidence;
+    std::vector<double> bbox;
+};
+
+struct HandPose {
+    std::string label;
+    double confidence;
+};
+
+struct Settings {
+    bool speech_enabled;
+    bool vision_enabled;
+    bool gesture_enabled;
+    bool tts_enabled;
+};
+
+struct TurnContext {
+    std::string timestamp;
+    std::string recipe_id;
+    std::string step_id;
+    std::string branch_id;
+    std::string user_utterance;
+    Gesture gesture;
+    std::vector<Detection> detections;
+    HandPose hand_pose;
+    Settings settings;
+};
+
+struct UiOverlay {
+    std::string type;
+    std::string target;
+};
+
+struct PlannerResponse {
+    std::string assistant_text;
+    bool speak;
+    bool interruptible;
+    bool advance_step;
+    std::string new_branch_id;
+    std::vector<UiOverlay> ui_overlays;
+};
+
 void Log(const std::string& message) {
     std::cout << "[MiMoCA] " << message << '\n';
 }
 
-bool CheckPythonHealth(const std::string& host, int port) {
+std::string BoolJson(const bool value) {
+    return value ? "true" : "false";
+}
+
+std::string EscapeJson(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const char c : text) {
+        if (c == '\\' || c == '"') {
+            out.push_back('\\');
+            out.push_back(c);
+        } else if (c == '\n') {
+            out += "\\n";
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+std::string SerializeTurnContext(const TurnContext& tc) {
+    std::string json = "{";
+    json += "\"timestamp\":\"" + EscapeJson(tc.timestamp) + "\",";
+    json += "\"recipe_id\":\"" + EscapeJson(tc.recipe_id) + "\",";
+    json += "\"step_id\":\"" + EscapeJson(tc.step_id) + "\",";
+    if (tc.branch_id.empty()) {
+        json += "\"branch_id\":null,";
+    } else {
+        json += "\"branch_id\":\"" + EscapeJson(tc.branch_id) + "\",";
+    }
+    json += "\"user_utterance\":\"" + EscapeJson(tc.user_utterance) + "\",";
+    json += "\"gesture\":{";
+    json += "\"label\":\"" + EscapeJson(tc.gesture.label) + "\",";
+    json += "\"confidence\":" + std::to_string(tc.gesture.confidence);
+    json += "},";
+    json += "\"detections\":[";
+    for (size_t i = 0; i < tc.detections.size(); ++i) {
+        const auto& d = tc.detections[i];
+        if (i > 0) {
+            json += ",";
+        }
+        json += "{";
+        json += "\"label\":\"" + EscapeJson(d.label) + "\",";
+        json += "\"confidence\":" + std::to_string(d.confidence) + ",";
+        json += "\"bbox\":[";
+        for (size_t j = 0; j < d.bbox.size(); ++j) {
+            if (j > 0) {
+                json += ",";
+            }
+            json += std::to_string(d.bbox[j]);
+        }
+        json += "]}";
+    }
+    json += "],";
+    json += "\"hand_pose\":{";
+    json += "\"label\":\"" + EscapeJson(tc.hand_pose.label) + "\",";
+    json += "\"confidence\":" + std::to_string(tc.hand_pose.confidence);
+    json += "},";
+    json += "\"settings\":{";
+    json += "\"speech_enabled\":" + BoolJson(tc.settings.speech_enabled) + ",";
+    json += "\"vision_enabled\":" + BoolJson(tc.settings.vision_enabled) + ",";
+    json += "\"gesture_enabled\":" + BoolJson(tc.settings.gesture_enabled) + ",";
+    json += "\"tts_enabled\":" + BoolJson(tc.settings.tts_enabled);
+    json += "}}";
+    return json;
+}
+
+std::string ExtractJsonFieldString(const std::string& json, const std::string& field) {
+    const std::string key = "\"" + field + "\":";
+    const size_t key_pos = json.find(key);
+    if (key_pos == std::string::npos) {
+        return "";
+    }
+
+    size_t pos = key_pos + key.size();
+    while (pos < json.size() && json[pos] == ' ') {
+        ++pos;
+    }
+
+    if (json.compare(pos, 4, "null") == 0) {
+        return "";
+    }
+
+    if (pos >= json.size() || json[pos] != '"') {
+        return "";
+    }
+    ++pos;
+
+    std::string result;
+    while (pos < json.size()) {
+        const char c = json[pos++];
+        if (c == '\\' && pos < json.size()) {
+            result.push_back(json[pos++]);
+        } else if (c == '"') {
+            break;
+        } else {
+            result.push_back(c);
+        }
+    }
+    return result;
+}
+
+bool ExtractJsonFieldBool(const std::string& json, const std::string& field, bool default_value = false) {
+    const std::string key = "\"" + field + "\":";
+    const size_t key_pos = json.find(key);
+    if (key_pos == std::string::npos) {
+        return default_value;
+    }
+
+    size_t pos = key_pos + key.size();
+    while (pos < json.size() && json[pos] == ' ') {
+        ++pos;
+    }
+
+    if (json.compare(pos, 4, "true") == 0) {
+        return true;
+    }
+    if (json.compare(pos, 5, "false") == 0) {
+        return false;
+    }
+    return default_value;
+}
+
+std::string ExtractHttpBody(const std::string& response) {
+    const std::string header_delim = "\r\n\r\n";
+    const size_t pos = response.find(header_delim);
+    if (pos == std::string::npos) {
+        return "";
+    }
+    return response.substr(pos + header_delim.size());
+}
+
+PlannerResponse ParsePlannerResponseBody(const std::string& body) {
+    PlannerResponse response{};
+    response.assistant_text = ExtractJsonFieldString(body, "assistant_text");
+    response.speak = ExtractJsonFieldBool(body, "speak", false);
+    response.interruptible = ExtractJsonFieldBool(body, "interruptible", true);
+    response.advance_step = ExtractJsonFieldBool(body, "advance_step", false);
+    response.new_branch_id = ExtractJsonFieldString(body, "new_branch_id");
+
+    const size_t overlays_pos = body.find("\"ui_overlays\"");
+    if (overlays_pos != std::string::npos) {
+        const std::string type = ExtractJsonFieldString(body.substr(overlays_pos), "type");
+        const std::string target = ExtractJsonFieldString(body.substr(overlays_pos), "target");
+        if (!type.empty() || !target.empty()) {
+            response.ui_overlays.push_back({type, target});
+        }
+    }
+
+    return response;
+}
+
+bool SendHttpRequest(const std::string& host, int port, const std::string& request, std::string& response_out) {
 #ifdef _WIN32
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
@@ -32,7 +233,7 @@ bool CheckPythonHealth(const std::string& host, int port) {
 
     int socket_fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
     if (socket_fd < 0) {
-        Log("Failed to create socket for sidecar health check.");
+        Log("Failed to create socket.");
 #ifdef _WIN32
         WSACleanup();
 #endif
@@ -44,7 +245,7 @@ bool CheckPythonHealth(const std::string& host, int port) {
     server_addr.sin_port = htons(static_cast<uint16_t>(port));
 
     if (::inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
-        Log("Invalid sidecar host address: " + host);
+        Log("Invalid host address: " + host);
 #ifdef _WIN32
         closesocket(socket_fd);
         WSACleanup();
@@ -65,19 +266,13 @@ bool CheckPythonHealth(const std::string& host, int port) {
         return false;
     }
 
-    const std::string request =
-        "GET /health HTTP/1.1\r\n"
-        "Host: " +
-        host + "\r\n"
-               "Connection: close\r\n\r\n";
-
 #ifdef _WIN32
     const int sent = send(socket_fd, request.c_str(), static_cast<int>(request.size()), 0);
 #else
     const ssize_t sent = send(socket_fd, request.c_str(), request.size(), 0);
 #endif
     if (sent <= 0) {
-        Log("Failed to send sidecar health request.");
+        Log("Failed to send request to Python sidecar.");
 #ifdef _WIN32
         closesocket(socket_fd);
         WSACleanup();
@@ -87,8 +282,8 @@ bool CheckPythonHealth(const std::string& host, int port) {
         return false;
     }
 
-    std::string response;
-    char buffer[512];
+    response_out.clear();
+    char buffer[1024];
     while (true) {
 #ifdef _WIN32
         const int bytes_read = recv(socket_fd, buffer, static_cast<int>(sizeof(buffer)), 0);
@@ -98,7 +293,7 @@ bool CheckPythonHealth(const std::string& host, int port) {
         if (bytes_read <= 0) {
             break;
         }
-        response.append(buffer, static_cast<size_t>(bytes_read));
+        response_out.append(buffer, static_cast<size_t>(bytes_read));
     }
 
 #ifdef _WIN32
@@ -107,6 +302,21 @@ bool CheckPythonHealth(const std::string& host, int port) {
 #else
     close(socket_fd);
 #endif
+
+    return !response_out.empty();
+}
+
+bool CheckPythonHealth(const std::string& host, int port) {
+    const std::string request =
+        "GET /health HTTP/1.1\r\n"
+        "Host: " +
+        host + "\r\n"
+               "Connection: close\r\n\r\n";
+
+    std::string response;
+    if (!SendHttpRequest(host, port, request, response)) {
+        return false;
+    }
 
     const bool ok = response.find("200 OK") != std::string::npos;
     if (ok) {
@@ -117,6 +327,78 @@ bool CheckPythonHealth(const std::string& host, int port) {
 
     Log("Sidecar response preview: " + response.substr(0, std::min<size_t>(response.size(), 180)));
     return ok;
+}
+
+std::string MakeIsoTimestampNow() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buffer);
+}
+
+TurnContext BuildSampleTurnContext() {
+    return TurnContext{
+        MakeIsoTimestampNow(),
+        "demo_omelet",
+        "step_1",
+        "",
+        "what next?",
+        Gesture{"next", 0.98},
+        std::vector<Detection>{Detection{"knife", 0.93, {0.1, 0.2, 0.3, 0.4}}},
+        HandPose{"safe_claw", 0.87},
+        Settings{true, true, true, true},
+    };
+}
+
+bool RequestMockPlanner(const std::string& host, int port, const TurnContext& turn_context, PlannerResponse& out) {
+    const std::string body = SerializeTurnContext(turn_context);
+    Log("Serialized TurnContext request: " + body);
+
+    const std::string request =
+        "POST /plan HTTP/1.1\r\n"
+        "Host: " +
+        host + "\r\n"
+               "Content-Type: application/json\r\n"
+               "Connection: close\r\n"
+               "Content-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    std::string response;
+    if (!SendHttpRequest(host, port, request, response)) {
+        return false;
+    }
+
+    const std::string response_body = ExtractHttpBody(response);
+    Log("Serialized PlannerResponse body: " + response_body);
+
+    if (response.find("200 OK") == std::string::npos || response_body.empty()) {
+        return false;
+    }
+
+    out = ParsePlannerResponseBody(response_body);
+    return true;
+}
+
+void PrintPlannerResponse(const PlannerResponse& response) {
+    Log("Planner response parsed:");
+    std::cout << "  assistant_text: " << response.assistant_text << '\n';
+    std::cout << "  speak: " << (response.speak ? "true" : "false") << '\n';
+    std::cout << "  interruptible: " << (response.interruptible ? "true" : "false") << '\n';
+    std::cout << "  advance_step: " << (response.advance_step ? "true" : "false") << '\n';
+    std::cout << "  new_branch_id: " << (response.new_branch_id.empty() ? "null" : response.new_branch_id) << '\n';
+    if (!response.ui_overlays.empty()) {
+        std::cout << "  ui_overlays[0].type: " << response.ui_overlays[0].type << '\n';
+        std::cout << "  ui_overlays[0].target: " << response.ui_overlays[0].target << '\n';
+    } else {
+        std::cout << "  ui_overlays: []\n";
+    }
 }
 
 }  // namespace
@@ -132,6 +414,13 @@ int main() {
     const bool sidecar_ok = CheckPythonHealth("127.0.0.1", 8080);
     if (!sidecar_ok) {
         Log("Continuing without Python sidecar (graceful degradation). Start python/service.py to enable it.");
+    } else {
+        PlannerResponse response{};
+        if (RequestMockPlanner("127.0.0.1", 8080, BuildSampleTurnContext(), response)) {
+            PrintPlannerResponse(response);
+        } else {
+            Log("Mock planner request failed; staying in recipe-only fallback mode.");
+        }
     }
 
     Log("Press Enter to exit...");
