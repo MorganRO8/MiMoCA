@@ -1,34 +1,50 @@
 {
   "recipes": [
     {
-      "id": "demo_omelet",
-      "name": "Simple Omelet",
-      "ingredients": ["eggs", "salt", "butter"],
-      "tools": ["bowl", "fork", "pan"],
+      "id": "demo_rice",
+      "name": "Rice: Cooker or Pot",
+      "ingredients": ["rice", "water", "salt"],
+      "tools": ["rice cooker", "pot", "lid", "strainer"],
       "steps": [
         {
           "id": "step_1",
-          "instruction": "Crack two eggs into a bowl and whisk with a pinch of salt.",
+          "instruction": "Rinse 1 cup of rice until the water runs mostly clear.",
           "next_step_id": "step_2",
           "branch_point_id": null
         },
         {
           "id": "step_2",
-          "instruction": "Heat butter in a pan over medium heat and pour in the eggs.",
-          "next_step_id": "step_3",
-          "branch_point_id": "doneness_choice"
+          "instruction": "Choose your method: say rice cooker or pot, or gesture option_a / option_b.",
+          "next_step_id": null,
+          "branch_point_id": "cook_method",
+          "branch_next_step_ids": {
+            "rice_cooker": "step_3_rice_cooker",
+            "pot": "step_3_pot"
+          }
         },
         {
-          "id": "step_3",
-          "instruction": "Fold when mostly set, then serve.",
+          "id": "step_3_rice_cooker",
+          "instruction": "Rice cooker path: add rice and 1.25 cups water, then press cook.",
+          "next_step_id": "step_4_finish",
+          "branch_point_id": null
+        },
+        {
+          "id": "step_3_pot",
+          "instruction": "Pot path: bring rice and 1.5 cups water to a boil, then simmer covered for 15 minutes.",
+          "next_step_id": "step_4_finish",
+          "branch_point_id": null
+        },
+        {
+          "id": "step_4_finish",
+          "instruction": "Rest covered for 5 minutes, fluff with a fork, and serve.",
           "next_step_id": null,
           "branch_point_id": null
         }
       ],
       "branch_points": [
         {
-          "id": "doneness_choice",
-          "options": ["soft", "firm"]
+          "id": "cook_method",
+          "options": ["rice_cooker", "pot"]
         }
       ]
     }

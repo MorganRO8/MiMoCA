@@ -27,11 +27,35 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
         gesture_confidence = 0.0
     current_step_instruction = str(turn_context.get("current_step_instruction", "")).strip()
     next_step_instruction = str(turn_context.get("next_step_instruction", "")).strip()
+    branch_id = str(turn_context.get("branch_id", "") or "").strip().lower()
     gesture_present = gesture_label in {"next", "repeat", "option_a", "option_b"} and gesture_confidence > 0.0
 
-    if gesture_present and gesture_label == "next":
+    if gesture_present and gesture_label == "option_a":
+        assistant_text = "Gesture selected rice cooker branch."
+        advance_step = False
+        target = "branch_rice_cooker"
+        new_branch_id = "rice_cooker"
+    elif gesture_present and gesture_label == "option_b":
+        assistant_text = "Gesture selected pot branch."
+        advance_step = False
+        target = "branch_pot"
+        new_branch_id = "pot"
+    elif "rice cooker" in utterance:
+        assistant_text = "Okay, using the rice cooker branch."
+        advance_step = False
+        target = "branch_rice_cooker"
+        new_branch_id = "rice_cooker"
+    elif "pot" in utterance:
+        assistant_text = "Okay, using the pot branch."
+        advance_step = False
+        target = "branch_pot"
+        new_branch_id = "pot"
+    elif gesture_present and gesture_label == "next":
         if next_step_instruction:
-            assistant_text = f"Gesture next: {next_step_instruction}"
+            if branch_id:
+                assistant_text = f"Gesture next ({branch_id}): {next_step_instruction}"
+            else:
+                assistant_text = f"Gesture next: {next_step_instruction}"
             advance_step = True
             target = "next_step"
         else:
@@ -41,26 +65,20 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
         new_branch_id = None
     elif gesture_present and gesture_label == "repeat":
         assistant_text = (
-            f"Gesture repeat: {current_step_instruction}"
+            f"Gesture repeat ({branch_id}): {current_step_instruction}"
+            if branch_id and current_step_instruction
+            else f"Gesture repeat: {current_step_instruction}"
             if current_step_instruction
             else "Gesture repeat received, but current step is unavailable."
         )
         advance_step = False
         target = "current_step"
         new_branch_id = None
-    elif gesture_present and gesture_label == "option_a":
-        assistant_text = "Gesture selected option A branch."
-        advance_step = False
-        target = "branch_option_a"
-        new_branch_id = "option_a"
-    elif gesture_present and gesture_label == "option_b":
-        assistant_text = "Gesture selected option B branch."
-        advance_step = False
-        target = "branch_option_b"
-        new_branch_id = "option_b"
     elif "current step" in utterance:
         assistant_text = (
-            f"Current step: {current_step_instruction}"
+            f"Current step ({branch_id}): {current_step_instruction}"
+            if branch_id and current_step_instruction
+            else f"Current step: {current_step_instruction}"
             if current_step_instruction
             else "Current step is not available."
         )
@@ -69,7 +87,10 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
         new_branch_id = None
     elif "what next" in utterance or gesture_label == "next":
         if next_step_instruction:
-            assistant_text = f"Next instruction: {next_step_instruction}"
+            if branch_id:
+                assistant_text = f"Next instruction ({branch_id}): {next_step_instruction}"
+            else:
+                assistant_text = f"Next instruction: {next_step_instruction}"
             advance_step = True
             target = "next_step"
         else:
@@ -152,6 +173,8 @@ class Handler(BaseHTTPRequestHandler):
         logging.info("serialized TurnContext request: %s", json.dumps(turn_context, separators=(",", ":")))
         logging.info("planner received user_utterance: %s", turn_context.get("user_utterance", ""))
         planner_response = _deterministic_mock_planner(turn_context)
+        if planner_response.get("new_branch_id"):
+            logging.info("planner branch selection: %s", planner_response.get("new_branch_id"))
         logging.info("serialized PlannerResponse response: %s", json.dumps(planner_response, separators=(",", ":")))
         self._write_json(200, planner_response)
 

@@ -11,11 +11,11 @@ This repo now includes:
 - Python sidecar (`python/service.py`) with:
   - `GET /health`
   - `POST /plan` mock planner using the canonical `TurnContext` and `PlannerResponse` contracts
-- Recipe asset file (`assets/recipes.json`) with one sample recipe and a future branch point shape
+- Recipe asset file (`assets/recipes.json`) with one real branching demo (`rice_cooker` vs `pot`)
 
 The C++ app now runs a tiny end-to-end path:
 1. load one recipe from `assets/recipes.json`
-2. track current step in memory
+2. track current step and selected recipe branches in memory
 3. health-check sidecar
 4. accept utterances from a minimal speech adapter boundary (`say-partial ...`, `say-final ...`) or shortcut commands (`current`, `next`)
 5. accept debug gesture injection (`gesture <label> [confidence]`) with tiny vocabulary: `next`, `repeat`, `option_a`, `option_b`, `none`
@@ -23,8 +23,9 @@ The C++ app now runs a tiny end-to-end path:
 7. log partial/final transcript events in the app and log utterance receipt in the sidecar
 8. parse `PlannerResponse`
 9. speak `assistant_text` with Windows SAPI when `speak` is true
-10. advance local step if `advance_step` is true
-11. start camera capture on device `0` and keep a latest-frame summary (availability, width/height, timestamp, frame count) for planner turns
+10. select and persist branch choices from utterance (`rice cooker` / `pot`) or gestures (`option_a` / `option_b`)
+11. advance local step if `advance_step` is true, using branch-specific next-step routing when a branch is selected
+12. start camera capture on device `0` and keep a latest-frame summary (availability, width/height, timestamp, frame count) for planner turns
 
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
 The C++ app also logs camera lifecycle events (start/stop/first-frame availability).
@@ -58,6 +59,7 @@ On startup, the app loads the sample recipe and then accepts these commands:
 - `current` → ask planner for current step
 - `next` → ask planner for next instruction (and advance if available)
 - `gesture <label> [confidence]` → run a gesture-only planner turn using one of: `next`, `repeat`, `option_a`, `option_b`, `none`
+- `say-final rice cooker` / `say-final pot` → select a real branch at the branch step
 - `camera` → print camera status and latest frame summary
 - `say-partial <text>` → emit a mock partial transcript event (logged only)
 - `say-final <text>` → emit a mock final transcript event and run a planner turn with that utterance

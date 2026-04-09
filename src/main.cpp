@@ -100,18 +100,26 @@ struct RecipeStep {
     std::string instruction;
     std::string next_step_id;
     std::string branch_point_id;
+    std::unordered_map<std::string, std::string> branch_next_step_ids;
+};
+
+struct BranchPoint {
+    std::string id;
+    std::vector<std::string> options;
 };
 
 struct Recipe {
     std::string id;
     std::string name;
     std::vector<RecipeStep> steps;
+    std::unordered_map<std::string, BranchPoint> branch_points_by_id;
     std::unordered_map<std::string, size_t> step_index_by_id;
 };
 
 struct RecipeState {
     Recipe recipe;
     size_t current_step_index;
+    std::unordered_map<std::string, std::string> selected_branch_by_point;
 };
 
 struct TranscriptEvent {
@@ -287,6 +295,98 @@ std::string ExtractJsonFieldString(const std::string& json, const std::string& f
         }
     }
     return result;
+}
+
+std::string ExtractJsonFieldObject(const std::string& json, const std::string& field) {
+    const std::string key = "\"" + field + "\":";
+    const size_t key_pos = json.find(key);
+    if (key_pos == std::string::npos) {
+        return "";
+    }
+
+    size_t pos = key_pos + key.size();
+    while (pos < json.size() && json[pos] == ' ') {
+        ++pos;
+    }
+    if (pos >= json.size() || json[pos] != '{') {
+        return "";
+    }
+
+    const size_t end = FindMatchingChar(json, pos, '{', '}');
+    if (end == std::string::npos) {
+        return "";
+    }
+    return json.substr(pos, end - pos + 1);
+}
+
+std::vector<std::string> ExtractJsonStringArray(const std::string& json, const std::string& field) {
+    std::vector<std::string> values;
+    const std::string key = "\"" + field + "\":";
+    const size_t key_pos = json.find(key);
+    if (key_pos == std::string::npos) {
+        return values;
+    }
+
+    size_t pos = key_pos + key.size();
+    while (pos < json.size() && json[pos] == ' ') {
+        ++pos;
+    }
+    if (pos >= json.size() || json[pos] != '[') {
+        return values;
+    }
+
+    const size_t end = FindMatchingChar(json, pos, '[', ']');
+    if (end == std::string::npos) {
+        return values;
+    }
+
+    size_t cursor = pos + 1;
+    while (cursor < end) {
+        const size_t quote_start = json.find('"', cursor);
+        if (quote_start == std::string::npos || quote_start >= end) {
+            break;
+        }
+        const size_t quote_end = json.find('"', quote_start + 1);
+        if (quote_end == std::string::npos || quote_end > end) {
+            break;
+        }
+        values.push_back(json.substr(quote_start + 1, quote_end - quote_start - 1));
+        cursor = quote_end + 1;
+    }
+    return values;
+}
+
+std::unordered_map<std::string, std::string> ExtractJsonStringMap(const std::string& json, const std::string& field) {
+    std::unordered_map<std::string, std::string> values;
+    const std::string object_json = ExtractJsonFieldObject(json, field);
+    if (object_json.empty()) {
+        return values;
+    }
+
+    size_t cursor = 0;
+    while (cursor < object_json.size()) {
+        const size_t key_start = object_json.find('"', cursor);
+        if (key_start == std::string::npos) {
+            break;
+        }
+        const size_t key_end = object_json.find('"', key_start + 1);
+        if (key_end == std::string::npos) {
+            break;
+        }
+        const size_t value_start = object_json.find('"', key_end + 1);
+        if (value_start == std::string::npos) {
+            break;
+        }
+        const size_t value_end = object_json.find('"', value_start + 1);
+        if (value_end == std::string::npos) {
+            break;
+        }
+        values[object_json.substr(key_start + 1, key_end - key_start - 1)] =
+            object_json.substr(value_start + 1, value_end - value_start - 1);
+        cursor = value_end + 1;
+    }
+
+    return values;
 }
 
 bool ExtractJsonFieldBool(const std::string& json, const std::string& field, bool default_value = false) {
@@ -615,6 +715,7 @@ bool LoadFirstRecipe(const std::string& path, Recipe& out_recipe) {
         step.instruction = ExtractJsonFieldString(step_json, "instruction");
         step.next_step_id = ExtractJsonFieldString(step_json, "next_step_id");
         step.branch_point_id = ExtractJsonFieldString(step_json, "branch_point_id");
+        step.branch_next_step_ids = ExtractJsonStringMap(step_json, "branch_next_step_ids");
         if (!step.id.empty() && !step.instruction.empty()) {
             out_recipe.steps.push_back(step);
         }
@@ -627,12 +728,45 @@ bool LoadFirstRecipe(const std::string& path, Recipe& out_recipe) {
         out_recipe.step_index_by_id[out_recipe.steps[i].id] = i;
     }
 
+    out_recipe.branch_points_by_id.clear();
+    const size_t branch_points_key = recipe_json.find("\"branch_points\"");
+    if (branch_points_key != std::string::npos) {
+        const size_t branch_points_start = recipe_json.find('[', branch_points_key);
+        if (branch_points_start != std::string::npos) {
+            const size_t branch_points_end = FindMatchingChar(recipe_json, branch_points_start, '[', ']');
+            if (branch_points_end != std::string::npos) {
+                size_t branch_cursor = branch_points_start + 1;
+                while (branch_cursor < branch_points_end) {
+                    const size_t branch_start = recipe_json.find('{', branch_cursor);
+                    if (branch_start == std::string::npos || branch_start > branch_points_end) {
+                        break;
+                    }
+                    const size_t branch_end = FindMatchingChar(recipe_json, branch_start, '{', '}');
+                    if (branch_end == std::string::npos || branch_end > branch_points_end) {
+                        break;
+                    }
+
+                    const std::string branch_json = recipe_json.substr(branch_start, branch_end - branch_start + 1);
+                    BranchPoint point{};
+                    point.id = ExtractJsonFieldString(branch_json, "id");
+                    point.options = ExtractJsonStringArray(branch_json, "options");
+                    if (!point.id.empty() && !point.options.empty()) {
+                        out_recipe.branch_points_by_id[point.id] = point;
+                    }
+
+                    branch_cursor = branch_end + 1;
+                }
+            }
+        }
+    }
+
     if (out_recipe.id.empty() || out_recipe.steps.empty()) {
         Log("Recipe parse produced empty data.");
         return false;
     }
 
-    Log("Loaded recipe '" + out_recipe.name + "' with " + std::to_string(out_recipe.steps.size()) + " steps.");
+    Log("Loaded recipe '" + out_recipe.name + "' with " + std::to_string(out_recipe.steps.size()) + " steps and " +
+        std::to_string(out_recipe.branch_points_by_id.size()) + " branch points.");
     return true;
 }
 
@@ -645,11 +779,28 @@ const RecipeStep* GetCurrentStep(const RecipeState& state) {
 
 const RecipeStep* GetNextStep(const RecipeState& state) {
     const RecipeStep* current = GetCurrentStep(state);
-    if (current == nullptr || current->next_step_id.empty()) {
+    if (current == nullptr) {
         return nullptr;
     }
 
-    const auto it = state.recipe.step_index_by_id.find(current->next_step_id);
+    std::string next_step_id = current->next_step_id;
+    if (!current->branch_point_id.empty()) {
+        const auto selected_it = state.selected_branch_by_point.find(current->branch_point_id);
+        if (selected_it != state.selected_branch_by_point.end()) {
+            const auto branch_next_it = current->branch_next_step_ids.find(selected_it->second);
+            if (branch_next_it != current->branch_next_step_ids.end()) {
+                next_step_id = branch_next_it->second;
+                Log("Branch flow: branch_point_id='" + current->branch_point_id + "', selected='" +
+                    selected_it->second + "', next_step_id='" + next_step_id + "'.");
+            }
+        }
+    }
+
+    if (next_step_id.empty()) {
+        return nullptr;
+    }
+
+    const auto it = state.recipe.step_index_by_id.find(next_step_id);
     if (it == state.recipe.step_index_by_id.end()) {
         return nullptr;
     }
@@ -658,17 +809,81 @@ const RecipeStep* GetNextStep(const RecipeState& state) {
 }
 
 bool AdvanceCurrentStep(RecipeState& state) {
+    const RecipeStep* next = GetNextStep(state);
+    if (next == nullptr) {
+        return false;
+    }
+
+    state.current_step_index = state.recipe.step_index_by_id[next->id];
+    return true;
+}
+
+std::string NormalizeBranchText(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        if (c == '_' || c == '-') {
+            return ' ';
+        }
+        return static_cast<char>(std::tolower(c));
+    });
+    return text;
+}
+
+std::string ResolveBranchSelection(const RecipeState& state, const std::string& utterance, const Gesture& gesture) {
     const RecipeStep* current = GetCurrentStep(state);
-    if (current == nullptr || current->next_step_id.empty()) {
+    if (current == nullptr || current->branch_point_id.empty()) {
+        return "";
+    }
+
+    const auto point_it = state.recipe.branch_points_by_id.find(current->branch_point_id);
+    if (point_it == state.recipe.branch_points_by_id.end() || point_it->second.options.empty()) {
+        return "";
+    }
+
+    const std::vector<std::string>& options = point_it->second.options;
+    if (gesture.label == "option_a") {
+        return options[0];
+    }
+    if (gesture.label == "option_b" && options.size() > 1) {
+        return options[1];
+    }
+
+    const std::string normalized_utterance = NormalizeBranchText(utterance);
+    for (const std::string& option : options) {
+        if (ContainsText(normalized_utterance, NormalizeBranchText(option))) {
+            return option;
+        }
+    }
+
+    return "";
+}
+
+bool ApplyBranchSelection(RecipeState& state, const std::string& selected_branch, const std::string& source) {
+    const RecipeStep* current = GetCurrentStep(state);
+    if (current == nullptr || current->branch_point_id.empty() || selected_branch.empty()) {
         return false;
     }
 
-    const auto it = state.recipe.step_index_by_id.find(current->next_step_id);
-    if (it == state.recipe.step_index_by_id.end()) {
+    const auto point_it = state.recipe.branch_points_by_id.find(current->branch_point_id);
+    if (point_it == state.recipe.branch_points_by_id.end()) {
         return false;
     }
 
-    state.current_step_index = it->second;
+    bool option_exists = false;
+    for (const std::string& option : point_it->second.options) {
+        if (option == selected_branch) {
+            option_exists = true;
+            break;
+        }
+    }
+    if (!option_exists) {
+        Log("Branch selection ignored: unknown branch '" + selected_branch + "' for branch point '" +
+            current->branch_point_id + "'.");
+        return false;
+    }
+
+    state.selected_branch_by_point[current->branch_point_id] = selected_branch;
+    Log("Branch selected via " + source + ": branch_point_id='" + current->branch_point_id + "', branch='" +
+        selected_branch + "'.");
     return true;
 }
 
@@ -688,7 +903,22 @@ TurnContext BuildTurnContext(const RecipeState& state,
         MakeIsoTimestampNow(),
         state.recipe.id,
         current != nullptr ? current->id : "",
-        "",
+        [&state, current]() -> std::string {
+            if (current == nullptr || current->branch_point_id.empty()) {
+                if (!state.selected_branch_by_point.empty()) {
+                    return state.selected_branch_by_point.begin()->second;
+                }
+                return "";
+            }
+            const auto it = state.selected_branch_by_point.find(current->branch_point_id);
+            if (it != state.selected_branch_by_point.end()) {
+                return it->second;
+            }
+            if (!state.selected_branch_by_point.empty()) {
+                return state.selected_branch_by_point.begin()->second;
+            }
+            return "";
+        }(),
         utterance,
         current != nullptr ? current->instruction : "",
         next != nullptr ? next->instruction : "",
@@ -772,18 +1002,6 @@ PlannerResponse LocalRecipeFallback(const RecipeState& state, const std::string&
         } else {
             response.assistant_text = "You are at the final step.";
         }
-        return response;
-    }
-
-    if (ContainsText(normalized, "option_a")) {
-        response.assistant_text = "Selected option A branch.";
-        response.new_branch_id = "option_a";
-        return response;
-    }
-
-    if (ContainsText(normalized, "option_b")) {
-        response.assistant_text = "Selected option B branch.";
-        response.new_branch_id = "option_b";
         return response;
     }
 
@@ -1072,6 +1290,11 @@ int main() {
             continue;
         }
 
+        if (const std::string detected_branch = ResolveBranchSelection(recipe_state, utterance, turn_gesture);
+            !detected_branch.empty()) {
+            ApplyBranchSelection(recipe_state, detected_branch, turn_gesture.label == "none" ? "utterance" : "gesture");
+        }
+
         PlannerResponse response{};
         const CameraSnapshot camera_snapshot = camera.GetLatestSnapshot();
         if (sidecar_ok) {
@@ -1084,6 +1307,17 @@ int main() {
             response = LocalRecipeFallback(recipe_state, command);
         }
 
+        if (!response.new_branch_id.empty()) {
+            std::string planner_branch = response.new_branch_id;
+            if (planner_branch == "option_a" || planner_branch == "option_b") {
+                const Gesture planner_gesture{planner_branch, 1.0};
+                planner_branch = ResolveBranchSelection(recipe_state, "", planner_gesture);
+            }
+            if (!planner_branch.empty()) {
+                ApplyBranchSelection(recipe_state, planner_branch, "planner_response");
+            }
+        }
+
         PrintPlannerResponse(response);
         if (response.speak && !response.assistant_text.empty()) {
             tts.Speak(response.assistant_text);
@@ -1092,7 +1326,10 @@ int main() {
             if (AdvanceCurrentStep(recipe_state)) {
                 const RecipeStep* after = GetCurrentStep(recipe_state);
                 if (after != nullptr) {
-                    Log("Advanced to step: " + after->id);
+                    const std::string active_branch =
+                        recipe_state.selected_branch_by_point.empty() ? "" : recipe_state.selected_branch_by_point.begin()->second;
+                    Log("Advanced to step: " + after->id +
+                        (active_branch.empty() ? "" : " (active branch: " + active_branch + ")"));
                 }
             } else {
                 Log("No next step to advance to.");
