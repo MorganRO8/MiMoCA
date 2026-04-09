@@ -27,6 +27,7 @@ import numpy as np
 import cv2
 import mediapipe as mp
 from faster_whisper import WhisperModel
+from ultralytics import YOLO
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
@@ -36,6 +37,9 @@ DEFAULT_STT_MODEL = os.getenv("MIMOCA_STT_MODEL", "distil-large-v3")
 DEFAULT_STT_DEVICE = os.getenv("MIMOCA_STT_DEVICE", "cpu")
 DEFAULT_STT_COMPUTE_TYPE = os.getenv("MIMOCA_STT_COMPUTE_TYPE", "int8")
 DEFAULT_GESTURE_MODEL_PATH = os.getenv("MIMOCA_GESTURE_MODEL_PATH", "python/models/hand_landmarker.task")
+DEFAULT_VISION_MODEL = os.getenv("MIMOCA_VISION_MODEL", "yolov8s-worldv2.pt")
+DEFAULT_VISION_CONFIDENCE = float(os.getenv("MIMOCA_VISION_CONFIDENCE", "0.25"))
+FIXED_VOCABULARY = ["onion", "knife", "cutting board", "pot", "pan", "bowl", "spoon", "rice cooker"]
 
 
 @dataclass
@@ -471,6 +475,83 @@ class MediaPipeGestureAdapter:
 GESTURE_ADAPTER = MediaPipeGestureAdapter()
 
 
+class YoloVisionAdapter:
+    """Ultralytics YOLO adapter with a tiny fixed cooking vocabulary."""
+
+    def __init__(self) -> None:
+        self.model_name = DEFAULT_VISION_MODEL
+        self.confidence = DEFAULT_VISION_CONFIDENCE
+        self.vocabulary = list(FIXED_VOCABULARY)
+        self.model: YOLO | None = None
+        self.failure_reason = ""
+        self._init_model()
+
+    def _init_model(self) -> None:
+        try:
+            self.model = YOLO(self.model_name)
+            if "world" in self.model_name.lower():
+                self.model.set_classes(self.vocabulary)
+            logging.info("Vision adapter ready: model=%s vocabulary=%s", self.model_name, ",".join(self.vocabulary))
+        except Exception as exc:  # noqa: BLE001
+            self.failure_reason = "vision_model_init_failed"
+            self.model = None
+            logging.warning("Vision adapter disabled: %s", exc)
+
+    @staticmethod
+    def _decode_image(payload: dict) -> np.ndarray:
+        image_base64 = str(payload.get("image_base64", ""))
+        if not image_base64:
+            raise ValueError("image_base64_required")
+        try:
+            image_bytes = base64.b64decode(image_base64)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("invalid_image_base64") from exc
+        image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None or image.size == 0:
+            raise ValueError("invalid_image_bytes")
+        return image
+
+    def detect(self, payload: dict) -> dict:
+        if self.model is None:
+            return {"detections": [], "vision_available": False, "error": self.failure_reason or "vision_unavailable"}
+
+        image = self._decode_image(payload)
+        conf = float(payload.get("confidence_threshold", self.confidence) or self.confidence)
+        results = self.model.predict(source=image, conf=conf, verbose=False)
+
+        detections: list[dict] = []
+        for result in results:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            for box in boxes:
+                cls_idx = int(float(box.cls.item()))
+                label = str(result.names.get(cls_idx, "")).strip().lower()
+                if label not in self.vocabulary:
+                    continue
+                conf_score = float(box.conf.item())
+                xyxy = box.xyxy[0].tolist()
+                detections.append(
+                    {
+                        "label": label,
+                        "confidence": max(0.0, min(1.0, conf_score)),
+                        "bbox": [float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])],
+                    }
+                )
+
+        detections.sort(key=lambda d: d["confidence"], reverse=True)
+        logging.info("vision detect complete: count=%d labels=%s", len(detections), [d["label"] for d in detections[:6]])
+        return {
+            "detections": detections,
+            "vision_available": True,
+            "model": self.model_name,
+            "vocabulary": self.vocabulary,
+        }
+
+
+VISION_ADAPTER = YoloVisionAdapter()
+
+
 def _deterministic_mock_planner(turn_context: dict) -> dict:
     utterance = str(turn_context.get("user_utterance", "")).strip().lower()
     raw_utterance = str(turn_context.get("user_utterance", "")).strip()
@@ -608,6 +689,9 @@ class Handler(BaseHTTPRequestHandler):
                     "stt_compute_type": SPEECH_ADAPTER.compute_type,
                     "gesture_landmarker_available": GESTURE_ADAPTER.landmarker is not None,
                     "gesture_model_path": GESTURE_ADAPTER.model_path,
+                    "vision_available": VISION_ADAPTER.model is not None,
+                    "vision_model": VISION_ADAPTER.model_name,
+                    "vision_vocabulary": VISION_ADAPTER.vocabulary,
                 },
             )
             return
@@ -661,6 +745,10 @@ class Handler(BaseHTTPRequestHandler):
                     float(gesture.get("confidence", 0.0) or 0.0),
                     result.get("hands_detected", 0),
                 )
+                self._write_json(200, result)
+                return
+            if self.path == "/vision/detect":
+                result = VISION_ADAPTER.detect(payload)
                 self._write_json(200, result)
                 return
         except ValueError as exc:
