@@ -23,8 +23,10 @@ The C++ app now runs a tiny end-to-end path:
 7. parse `PlannerResponse`
 8. speak `assistant_text` with Windows SAPI when `speak` is true
 9. advance local step if `advance_step` is true
+10. start camera capture on device `0` and keep a latest-frame summary (availability, width/height, timestamp, frame count) for planner turns
 
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
+The C++ app also logs camera lifecycle events (start/stop/first-frame availability).
 
 ## Build and run (minimal)
 
@@ -54,10 +56,13 @@ The sidecar listens on `http://127.0.0.1:8080`.
 On startup, the app loads the sample recipe and then accepts these commands:
 - `current` → ask planner for current step
 - `next` → ask planner for next instruction (and advance if available)
+- `camera` → print camera status and latest frame summary
 - `say-partial <text>` → emit a mock partial transcript event (logged only)
 - `say-final <text>` → emit a mock final transcript event and run a planner turn with that utterance
 - `stop` → cancel current TTS playback (temporary manual interruption control)
 - `exit` → quit
+
+If OpenCV is available at build time, camera capture is enabled automatically. If OpenCV is not found, the app stays in graceful camera-disabled mode and still runs speech + planner flow.
 
 ## Manual health-path testing
 
