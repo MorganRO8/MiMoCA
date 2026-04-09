@@ -17,6 +17,33 @@ HOST = "127.0.0.1"
 PORT = 8080
 
 
+def _deterministic_mock_planner(turn_context: dict) -> dict:
+    utterance = str(turn_context.get("user_utterance", "")).strip().lower()
+    gesture_label = str(turn_context.get("gesture", {}).get("label", "none")).strip().lower()
+
+    if "what next" in utterance or gesture_label == "next":
+        assistant_text = "Next, chop the onion into small pieces on the cutting board."
+        advance_step = True
+        target = "onion"
+    elif "repeat" in utterance or gesture_label == "repeat":
+        assistant_text = "Repeat: chop the onion into small pieces on the cutting board."
+        advance_step = False
+        target = "cutting_board"
+    else:
+        assistant_text = "Mock planner ready. Ask 'what next?' or say 'repeat'."
+        advance_step = False
+        target = "knife"
+
+    return {
+        "assistant_text": assistant_text,
+        "speak": True,
+        "interruptible": True,
+        "advance_step": advance_step,
+        "new_branch_id": None,
+        "ui_overlays": [{"type": "highlight_label", "target": target}],
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def _write_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -59,18 +86,10 @@ class Handler(BaseHTTPRequestHandler):
             self._write_json(400, {"error": "invalid_json"})
             return
 
-        logging.info("plan payload keys=%s", sorted(turn_context.keys()))
-        self._write_json(
-            200,
-            {
-                "assistant_text": "Mock planner: ask me 'what next?' once recipe wiring is in place.",
-                "speak": True,
-                "interruptible": True,
-                "advance_step": False,
-                "new_branch_id": None,
-                "ui_overlays": [],
-            },
-        )
+        logging.info("serialized TurnContext request: %s", json.dumps(turn_context, separators=(",", ":")))
+        planner_response = _deterministic_mock_planner(turn_context)
+        logging.info("serialized PlannerResponse response: %s", json.dumps(planner_response, separators=(",", ":")))
+        self._write_json(200, planner_response)
 
 
 def main() -> None:
