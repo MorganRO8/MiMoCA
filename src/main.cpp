@@ -3,6 +3,7 @@
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -21,6 +22,11 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
+
+#ifdef MIMOCA_HAS_OPENCV
+#include <opencv2/core.hpp>
+#include <opencv2/videoio.hpp>
 #endif
 
 namespace {
@@ -59,7 +65,19 @@ struct TurnContext {
     Gesture gesture;
     std::vector<Detection> detections;
     HandPose hand_pose;
+    bool frame_available;
+    std::string frame_summary;
     Settings settings;
+};
+
+struct CameraSnapshot {
+    bool camera_started = false;
+    bool frame_available = false;
+    int width = 0;
+    int height = 0;
+    std::string capture_timestamp;
+    uint64_t frame_count = 0;
+    std::string status_message = "camera not initialized";
 };
 
 struct UiOverlay {
@@ -351,6 +369,8 @@ std::string SerializeTurnContext(const TurnContext& tc) {
     json += "\"label\":\"" + EscapeJson(tc.hand_pose.label) + "\",";
     json += "\"confidence\":" + std::to_string(tc.hand_pose.confidence);
     json += "},";
+    json += "\"frame_available\":" + BoolJson(tc.frame_available) + ",";
+    json += "\"frame_summary\":\"" + EscapeJson(tc.frame_summary) + "\",";
     json += "\"settings\":{";
     json += "\"speech_enabled\":" + BoolJson(tc.settings.speech_enabled) + ",";
     json += "\"vision_enabled\":" + BoolJson(tc.settings.vision_enabled) + ",";
@@ -646,9 +666,17 @@ bool AdvanceCurrentStep(RecipeState& state) {
     return true;
 }
 
-TurnContext BuildTurnContext(const RecipeState& state, const std::string& utterance, const std::string& gesture_label) {
+TurnContext BuildTurnContext(const RecipeState& state,
+                             const std::string& utterance,
+                             const std::string& gesture_label,
+                             const CameraSnapshot& camera_snapshot) {
     const RecipeStep* current = GetCurrentStep(state);
     const RecipeStep* next = GetNextStep(state);
+    const std::string frame_summary = camera_snapshot.frame_available
+                                          ? std::to_string(camera_snapshot.width) + "x" +
+                                                std::to_string(camera_snapshot.height) + " at " +
+                                                camera_snapshot.capture_timestamp
+                                          : camera_snapshot.status_message;
 
     return TurnContext{
         MakeIsoTimestampNow(),
@@ -661,6 +689,8 @@ TurnContext BuildTurnContext(const RecipeState& state, const std::string& uttera
         Gesture{gesture_label, 0.95},
         std::vector<Detection>{Detection{"cutting_board", 0.88, {0.2, 0.2, 0.7, 0.8}}},
         HandPose{"unknown", 0.0},
+        camera_snapshot.frame_available,
+        frame_summary,
         Settings{true, true, true, true},
     };
 }
@@ -780,6 +810,124 @@ class MockTranscriptInputAdapter final : public SpeechInputAdapter {
     }
 };
 
+class CameraController {
+   public:
+    ~CameraController() {
+        Stop();
+    }
+
+    bool Start(const int device_index) {
+#ifdef MIMOCA_HAS_OPENCV
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (running_) {
+            return true;
+        }
+
+        Log("Camera start requested on device index " + std::to_string(device_index) + ".");
+        if (!capture_.open(device_index, cv::CAP_ANY)) {
+            snapshot_.camera_started = false;
+            snapshot_.frame_available = false;
+            snapshot_.status_message = "camera unavailable (open failed)";
+            Log("Camera unavailable: failed to open device.");
+            return false;
+        }
+
+        running_ = true;
+        capture_thread_ = std::thread([this]() { CaptureLoop(); });
+        snapshot_.camera_started = true;
+        snapshot_.status_message = "camera started; waiting for first frame";
+        Log("Camera started.");
+        return true;
+#else
+        (void)device_index;
+        snapshot_.camera_started = false;
+        snapshot_.frame_available = false;
+        snapshot_.status_message = "camera disabled (OpenCV not linked)";
+        Log("Camera path disabled: build without OpenCV.");
+        return false;
+#endif
+    }
+
+    void Stop() {
+#ifdef MIMOCA_HAS_OPENCV
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!running_) {
+                return;
+            }
+            running_ = false;
+        }
+
+        if (capture_thread_.joinable()) {
+            capture_thread_.join();
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (capture_.isOpened()) {
+            capture_.release();
+        }
+        snapshot_.camera_started = false;
+        snapshot_.status_message = "camera stopped";
+        Log("Camera stopped after " + std::to_string(snapshot_.frame_count) + " captured frames.");
+#endif
+    }
+
+    CameraSnapshot GetLatestSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return snapshot_;
+    }
+
+   private:
+#ifdef MIMOCA_HAS_OPENCV
+    void CaptureLoop() {
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!running_) {
+                    return;
+                }
+            }
+
+            cv::Mat frame;
+            if (!capture_.read(frame) || frame.empty()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                snapshot_.frame_available = false;
+                snapshot_.status_message = "camera frame read failed";
+                std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                continue;
+            }
+
+            bool log_first_frame = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!snapshot_.frame_available) {
+                    log_first_frame = true;
+                }
+                snapshot_.frame_available = true;
+                snapshot_.width = frame.cols;
+                snapshot_.height = frame.rows;
+                snapshot_.capture_timestamp = MakeIsoTimestampNow();
+                snapshot_.frame_count += 1;
+                snapshot_.status_message = "camera running";
+            }
+
+            if (log_first_frame) {
+                Log("Camera frame available (" + std::to_string(frame.cols) + "x" + std::to_string(frame.rows) + ").");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+    }
+
+    mutable std::mutex mutex_;
+    cv::VideoCapture capture_;
+    std::thread capture_thread_;
+    bool running_ = false;
+#else
+    mutable std::mutex mutex_;
+#endif
+    CameraSnapshot snapshot_{};
+};
+
 }  // namespace
 
 int main() {
@@ -809,9 +957,11 @@ int main() {
 
     TtsController tts;
     MockTranscriptInputAdapter speech_input;
+    CameraController camera;
+    camera.Start(0);
     Log("Speech input adapter: " + speech_input.Name());
 
-    Log("Type 'current', 'next', 'stop' (cancel speech), 'say-partial <text>', 'say-final <text>', or 'exit'.");
+    Log("Type 'current', 'next', 'camera', 'stop' (cancel speech), 'say-partial <text>', 'say-final <text>', or 'exit'.");
     std::string line;
     while (std::getline(std::cin, line)) {
         line = Trim(line);
@@ -825,6 +975,19 @@ int main() {
 
         if (line == "stop") {
             tts.Stop();
+            continue;
+        }
+
+        if (line == "camera") {
+            const CameraSnapshot snapshot = camera.GetLatestSnapshot();
+            std::cout << "[MiMoCA] Camera status: " << snapshot.status_message << '\n';
+            std::cout << "  started: " << (snapshot.camera_started ? "true" : "false") << '\n';
+            std::cout << "  frame_available: " << (snapshot.frame_available ? "true" : "false") << '\n';
+            if (snapshot.frame_available) {
+                std::cout << "  latest_frame: " << snapshot.width << "x" << snapshot.height << '\n';
+                std::cout << "  captured_at: " << snapshot.capture_timestamp << '\n';
+                std::cout << "  frame_count: " << snapshot.frame_count << '\n';
+            }
             continue;
         }
 
@@ -855,9 +1018,11 @@ int main() {
         }
 
         PlannerResponse response{};
+        const CameraSnapshot camera_snapshot = camera.GetLatestSnapshot();
         if (sidecar_ok) {
             const std::string gesture = InferGestureLabelFromUtterance(utterance);
-            if (!RequestMockPlanner("127.0.0.1", 8080, BuildTurnContext(recipe_state, utterance, gesture), response)) {
+            if (!RequestMockPlanner("127.0.0.1", 8080, BuildTurnContext(recipe_state, utterance, gesture, camera_snapshot),
+                                    response)) {
                 Log("Planner call failed; using local recipe fallback for this turn.");
                 response = LocalRecipeFallback(recipe_state, command);
             }
@@ -881,6 +1046,7 @@ int main() {
         }
     }
 
+    camera.Stop();
     tts.Stop();
     Log("TTS gap: microphone-driven interruption is not wired yet; use 'stop' to cancel speech manually.");
     Log("Exiting MiMoCA prototype.");
