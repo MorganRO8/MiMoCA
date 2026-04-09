@@ -1060,6 +1060,7 @@ bool ApplyBranchSelection(RecipeState& state, const std::string& selected_branch
 TurnContext BuildTurnContext(const RecipeState& state,
                              const std::string& utterance,
                              const Gesture& gesture,
+                             const std::vector<Detection>& detections,
                              const CameraSnapshot& camera_snapshot) {
     const RecipeStep* current = GetCurrentStep(state);
     const RecipeStep* next = GetNextStep(state);
@@ -1093,7 +1094,7 @@ TurnContext BuildTurnContext(const RecipeState& state,
         current != nullptr ? current->instruction : "",
         next != nullptr ? next->instruction : "",
         gesture,
-        std::vector<Detection>{Detection{"cutting_board", 0.88, {0.2, 0.2, 0.7, 0.8}}},
+        detections,
         HandPose{"unknown", 0.0},
         camera_snapshot.frame_available,
         frame_summary,
@@ -1362,6 +1363,107 @@ bool RequestGestureDetection(const std::string& host,
     const std::string label = ExtractJsonFieldString(gesture_object, "label");
     const double confidence = ExtractJsonFieldDouble(gesture_object, "confidence", 0.0);
     out_gesture = Gesture{label.empty() ? "none" : label, std::clamp(confidence, 0.0, 1.0)};
+    return true;
+}
+
+std::vector<double> ParseNumberArray(const std::string& json_array) {
+    std::vector<double> values;
+    size_t cursor = 0;
+    while (cursor < json_array.size()) {
+        while (cursor < json_array.size() && json_array[cursor] != '-' && json_array[cursor] != '+' &&
+               (json_array[cursor] < '0' || json_array[cursor] > '9')) {
+            ++cursor;
+        }
+        if (cursor >= json_array.size()) {
+            break;
+        }
+        size_t end = cursor;
+        while (end < json_array.size()) {
+            const char c = json_array[end];
+            if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+') {
+                ++end;
+                continue;
+            }
+            break;
+        }
+        try {
+            values.push_back(std::stod(json_array.substr(cursor, end - cursor)));
+        } catch (const std::exception&) {
+        }
+        cursor = end + 1;
+    }
+    return values;
+}
+
+bool RequestVisionDetections(const std::string& host,
+                             const int port,
+                             const std::vector<uint8_t>& jpeg_bytes,
+                             std::vector<Detection>& out_detections) {
+    out_detections.clear();
+    if (jpeg_bytes.empty()) {
+        return false;
+    }
+    const std::string body = "{\"image_base64\":\"" + Base64Encode(jpeg_bytes) +
+                             "\",\"image_format\":\"jpeg\"}";
+    const std::string request =
+        "POST /vision/detect HTTP/1.1\r\n"
+        "Host: " +
+        host + "\r\n"
+               "Content-Type: application/json\r\n"
+               "Connection: close\r\n"
+               "Content-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    std::string response;
+    if (!SendHttpRequest(host, port, request, response)) {
+        return false;
+    }
+    const std::string response_body = ExtractHttpBody(response);
+    if (response.find("200 OK") == std::string::npos || response_body.empty()) {
+        return false;
+    }
+
+    const size_t detections_key = response_body.find("\"detections\"");
+    if (detections_key == std::string::npos) {
+        return true;
+    }
+    const size_t array_start = response_body.find('[', detections_key);
+    if (array_start == std::string::npos) {
+        return true;
+    }
+    const size_t array_end = FindMatchingChar(response_body, array_start, '[', ']');
+    if (array_end == std::string::npos) {
+        return true;
+    }
+    size_t cursor = array_start + 1;
+    while (cursor < array_end) {
+        const size_t obj_start = response_body.find('{', cursor);
+        if (obj_start == std::string::npos || obj_start > array_end) {
+            break;
+        }
+        const size_t obj_end = FindMatchingChar(response_body, obj_start, '{', '}');
+        if (obj_end == std::string::npos || obj_end > array_end) {
+            break;
+        }
+        const std::string det_obj = response_body.substr(obj_start, obj_end - obj_start + 1);
+        Detection det{};
+        det.label = ExtractJsonFieldString(det_obj, "label");
+        det.confidence = std::clamp(ExtractJsonFieldDouble(det_obj, "confidence", 0.0), 0.0, 1.0);
+        const size_t bbox_key = det_obj.find("\"bbox\"");
+        if (bbox_key != std::string::npos) {
+            const size_t bbox_start = det_obj.find('[', bbox_key);
+            if (bbox_start != std::string::npos) {
+                const size_t bbox_end = FindMatchingChar(det_obj, bbox_start, '[', ']');
+                if (bbox_end != std::string::npos) {
+                    det.bbox = ParseNumberArray(det_obj.substr(bbox_start, bbox_end - bbox_start + 1));
+                }
+            }
+        }
+        if (!det.label.empty()) {
+            out_detections.push_back(det);
+        }
+        cursor = obj_end + 1;
+    }
     return true;
 }
 
@@ -1790,6 +1892,7 @@ int main() {
         std::string utterance;
         std::string command = line;
         Gesture turn_gesture{"none", 0.0};
+        std::vector<Detection> turn_detections;
         TranscriptEvent transcript_event{};
         if (speech_input.TryConsumeConsoleLine(line, transcript_event) ||
             speech_input.TryStreamWavWithVadInterruption(line, tts, transcript_event)) {
@@ -1844,11 +1947,16 @@ int main() {
                 } else {
                     Log("Gesture detection unavailable for this turn; continuing with gesture='none'.");
                 }
+                if (!RequestVisionDetections("127.0.0.1", 8080, latest_frame_jpeg, turn_detections)) {
+                    Log("Vision detection unavailable for this turn; continuing with detections=[].");
+                } else {
+                    Log("Vision detections for turn: " + FormatDetectionsCompact(turn_detections));
+                }
             }
         }
 
         PlannerResponse response{};
-        const TurnContext turn_context = BuildTurnContext(recipe_state, utterance, turn_gesture, camera_snapshot);
+        const TurnContext turn_context = BuildTurnContext(recipe_state, utterance, turn_gesture, turn_detections, camera_snapshot);
         PlannerRoundTripStatus planner_status{};
         if (sidecar_ok) {
             planner_status.attempted = true;

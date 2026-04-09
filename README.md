@@ -11,6 +11,7 @@ This repo now includes:
 - Python sidecar (`python/service.py`) with:
   - `GET /health`
   - `POST /plan` mock planner using the canonical `TurnContext` and `PlannerResponse` contracts
+  - `POST /vision/detect` Ultralytics YOLO object detection with a fixed cooking vocabulary
 - Recipe asset file (`assets/recipes.json`) with one real branching demo (`rice_cooker` vs `pot`)
 
 The C++ app now runs a tiny end-to-end path:
@@ -28,6 +29,7 @@ The C++ app now runs a tiny end-to-end path:
 12. advance local step if `advance_step` is true, using branch-specific next-step routing when a branch is selected
 13. start camera capture on device `0` and keep a latest-frame summary (availability, width/height, timestamp, frame count) for planner turns
 14. optionally emit compact debug snapshots (transcript, gesture, detections, recipe/step/branch, planner round-trip status)
+15. run Ultralytics YOLO in the sidecar to populate `TurnContext.detections` from the latest camera frame (`label`, `confidence`, `bbox`)
 
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
 The C++ app also logs camera lifecycle events (start/stop/first-frame availability).
@@ -56,6 +58,11 @@ python3 -m pip install -r python/requirements.txt
 ```
 
 The sidecar listens on `http://127.0.0.1:8080`.
+
+Vision defaults:
+- `MIMOCA_VISION_MODEL=yolov8s-worldv2.pt`
+- `MIMOCA_VISION_CONFIDENCE=0.25`
+- fixed vocabulary: `onion`, `knife`, `cutting board`, `pot`, `pan`, `bowl`, `spoon`, `rice cooker`
 
 For MediaPipe gesture detection, provide a Hand Landmarker task model at:
 
@@ -175,5 +182,7 @@ Expected: deterministic mock `PlannerResponse` JSON payload that can request ste
 - The sidecar now includes lightweight RMS-based VAD in the chunk pipeline. When speech start is detected, the C++ app immediately interrupts TTS in streamed mode.
 - VAD segments utterances by detecting trailing silence. If VAD becomes unavailable (for example unsupported sample rate), interruption falls back to the manual `stop` command.
 - The sidecar now exposes `/gesture/detect`, backed by MediaPipe Hand Landmarker with a tiny heuristic classifier for `next`, `repeat`, `option_a`, `option_b`, `none`.
+- The sidecar now exposes `/vision/detect`, backed by Ultralytics YOLO and constrained to a small fixed cooking vocabulary. The C++ app sends the latest camera frame, receives detections (`label`, `confidence`, `bbox`), and forwards them in `TurnContext`.
+- If the YOLO model path points to an ONNX model, Ultralytics can run it with ONNX Runtime (`onnxruntime` dependency included).
 - The sidecar boundary is intentionally small and logged to keep iteration fast.
 - Recipe parsing is intentionally minimal and currently targets one startup recipe.
