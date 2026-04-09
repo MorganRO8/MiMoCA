@@ -67,6 +67,7 @@ On startup, the app loads the sample recipe and then accepts these commands:
 - `next` → ask planner for next instruction (and advance if available)
 - `gesture <label> [confidence]` → run a gesture-only planner turn using one of: `next`, `repeat`, `option_a`, `option_b`, `none`
 - `stt-file ./path/to/audio.wav` → transcribe a buffered WAV clip using faster-whisper and run a planner turn
+- `stt-stream-file ./path/to/audio.wav` → stream WAV PCM to sidecar in ~20 ms chunks, use VAD speech-start to auto-stop TTS, and segment utterances on silence
 - `camera` → print camera status and latest frame summary
 - `stop` → cancel current TTS playback (temporary manual interruption control)
 - `debug on` / `debug off` / `debug status` → enable, disable, or print compact debug state
@@ -150,6 +151,7 @@ Expected: deterministic mock `PlannerResponse` JSON payload that can request ste
 
 - STT is now a real sidecar adapter backed by `faster-whisper` with CTranslate2, CPU-first by default.
 - The sidecar exposes both buffered transcription (`/stt/transcribe`) and chunk-buffering endpoints (`/stt/session/start`, `/stt/session/chunk`, `/stt/session/finalize`) so partial/final transcript behavior can be added without redesigning the API.
-- TTS interruption is currently manual via `stop`; microphone-driven auto interruption is not wired yet.
+- The sidecar now includes lightweight RMS-based VAD in the chunk pipeline. When speech start is detected, the C++ app immediately interrupts TTS in streamed mode.
+- VAD segments utterances by detecting trailing silence. If VAD becomes unavailable (for example unsupported sample rate), interruption falls back to the manual `stop` command.
 - The sidecar boundary is intentionally small and logged to keep iteration fast.
 - Recipe parsing is intentionally minimal and currently targets one startup recipe.
