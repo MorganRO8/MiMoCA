@@ -19,7 +19,8 @@ The C++ app now runs a tiny end-to-end path:
 3. health-check sidecar
 4. send turn context to `POST /plan` for `current` and `next` queries
 5. parse `PlannerResponse`
-6. advance local step if `advance_step` is true
+6. speak `assistant_text` with Windows SAPI when `speak` is true
+7. advance local step if `advance_step` is true
 
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
 
@@ -51,6 +52,7 @@ The sidecar listens on `http://127.0.0.1:8080`.
 On startup, the app loads the sample recipe and then accepts these commands:
 - `current` → ask planner for current step
 - `next` → ask planner for next instruction (and advance if available)
+- `stop` → cancel current TTS playback (temporary manual interruption control)
 - `exit` → quit
 
 ## Manual health-path testing
@@ -93,5 +95,6 @@ Expected: deterministic mock `PlannerResponse` JSON payload that can request ste
 ## Notes
 
 - No real model integrations are included yet.
+- TTS interruption is currently manual via `stop`; microphone-driven auto interruption is not wired yet.
 - The sidecar boundary is intentionally small and logged to keep iteration fast.
 - Recipe parsing is intentionally minimal and currently targets one startup recipe.

@@ -1,14 +1,18 @@
+#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
+#include <sapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #pragma comment(lib, "Ws2_32.lib")
 #else
 #include <arpa/inet.h>
@@ -88,6 +92,97 @@ struct RecipeState {
     Recipe recipe;
     size_t current_step_index;
 };
+
+void Log(const std::string& message);
+
+#ifdef _WIN32
+class TtsController {
+   public:
+    TtsController() = default;
+
+    ~TtsController() {
+        Stop();
+    }
+
+    void Speak(const std::string& text) {
+        if (text.empty()) {
+            return;
+        }
+
+        Stop();
+        stop_requested_ = false;
+        speech_thread_ = std::thread([this, text]() {
+            Log("TTS start.");
+            const HRESULT init_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
+                Log("TTS unavailable: COM initialization failed.");
+                return;
+            }
+
+            ISpVoice* voice = nullptr;
+            const HRESULT create_hr = CoCreateInstance(CLSID_SpVoice, nullptr, CLSCTX_ALL, IID_ISpVoice,
+                                                       reinterpret_cast<void**>(&voice));
+            if (FAILED(create_hr) || voice == nullptr) {
+                Log("TTS unavailable: cannot create SAPI voice.");
+                if (SUCCEEDED(init_hr)) {
+                    CoUninitialize();
+                }
+                return;
+            }
+
+            std::wstring wtext(text.begin(), text.end());
+            voice->Speak(wtext.c_str(), SPF_ASYNC, nullptr);
+
+            while (!stop_requested_) {
+                SPVOICESTATUS status{};
+                if (FAILED(voice->GetStatus(&status, nullptr))) {
+                    break;
+                }
+                if (status.dwRunningState != SPRS_IS_SPEAKING) {
+                    break;
+                }
+                Sleep(30);
+            }
+
+            if (stop_requested_) {
+                voice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
+                Log("TTS stop requested; speech canceled.");
+            } else {
+                Log("TTS finished.");
+            }
+
+            voice->Release();
+            if (SUCCEEDED(init_hr)) {
+                CoUninitialize();
+            }
+        });
+    }
+
+    void Stop() {
+        if (!speech_thread_.joinable()) {
+            return;
+        }
+
+        Log("TTS stop requested.");
+        stop_requested_ = true;
+        speech_thread_.join();
+    }
+
+   private:
+    std::thread speech_thread_;
+    std::atomic<bool> stop_requested_{false};
+};
+#else
+class TtsController {
+   public:
+    void Speak(const std::string& text) {
+        if (!text.empty()) {
+            Log("TTS disabled on this platform; assistant_text not spoken.");
+        }
+    }
+    void Stop() {}
+};
+#endif
 
 void Log(const std::string& message) {
     std::cout << "[MiMoCA] " << message << '\n';
@@ -637,15 +732,22 @@ int main() {
         Log("Continuing without Python sidecar (graceful degradation). Start python/service.py to enable it.");
     }
 
-    Log("Type 'current' for current step, 'next' for next instruction, or 'exit'.");
+    TtsController tts;
+
+    Log("Type 'current', 'next', 'stop' (cancel speech), or 'exit'.");
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line == "exit") {
             break;
         }
 
+        if (line == "stop") {
+            tts.Stop();
+            continue;
+        }
+
         if (line != "current" && line != "next") {
-            Log("Unknown command. Use: current | next | exit");
+            Log("Unknown command. Use: current | next | stop | exit");
             continue;
         }
 
@@ -662,6 +764,9 @@ int main() {
         }
 
         PrintPlannerResponse(response);
+        if (response.speak && !response.assistant_text.empty()) {
+            tts.Speak(response.assistant_text);
+        }
         if (response.advance_step) {
             if (AdvanceCurrentStep(recipe_state)) {
                 const RecipeStep* after = GetCurrentStep(recipe_state);
@@ -674,6 +779,8 @@ int main() {
         }
     }
 
+    tts.Stop();
+    Log("TTS gap: microphone-driven interruption is not wired yet; use 'stop' to cancel speech manually.");
     Log("Exiting MiMoCA prototype.");
     return 0;
 }
