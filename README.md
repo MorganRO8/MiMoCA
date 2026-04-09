@@ -18,15 +18,16 @@ The C++ app now runs a tiny end-to-end path:
 2. track current step and selected recipe branches in memory
 3. health-check sidecar
 4. accept utterances through the Python STT boundary by sending buffered WAV audio (`stt-file <path.wav>`) or shortcut commands (`current`, `next`)
-5. accept debug gesture injection (`gesture <label> [confidence]`) with tiny vocabulary: `next`, `repeat`, `option_a`, `option_b`, `none`
+5. run MediaPipe hand tracking on the latest camera frame and classify a tiny fixed gesture vocabulary
 6. send turn context to `POST /plan` including `user_utterance` plus `gesture.label` and `gesture.confidence`
 7. transcribe audio in the sidecar with `faster-whisper` (CTranslate2 backend) and return transcript text to the app
 8. parse `PlannerResponse`
 9. speak `assistant_text` with Windows SAPI when `speak` is true
-10. select and persist branch choices from utterance (`rice cooker` / `pot`) or gestures (`option_a` / `option_b`)
-11. advance local step if `advance_step` is true, using branch-specific next-step routing when a branch is selected
-12. start camera capture on device `0` and keep a latest-frame summary (availability, width/height, timestamp, frame count) for planner turns
-13. optionally emit compact debug snapshots (transcript, gesture, detections, recipe/step/branch, planner round-trip status)
+10. map gesture predictions into app labels (`next`, `repeat`, `option_a`, `option_b`, `none`) and send them in `TurnContext`
+11. select and persist branch choices from utterance (`rice cooker` / `pot`) or gestures (`option_a` / `option_b`)
+12. advance local step if `advance_step` is true, using branch-specific next-step routing when a branch is selected
+13. start camera capture on device `0` and keep a latest-frame summary (availability, width/height, timestamp, frame count) for planner turns
+14. optionally emit compact debug snapshots (transcript, gesture, detections, recipe/step/branch, planner round-trip status)
 
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
 The C++ app also logs camera lifecycle events (start/stop/first-frame availability).
@@ -56,6 +57,18 @@ python3 -m pip install -r python/requirements.txt
 
 The sidecar listens on `http://127.0.0.1:8080`.
 
+For MediaPipe gesture detection, provide a Hand Landmarker task model at:
+
+```bash
+python/models/hand_landmarker.task
+```
+
+Or override with:
+
+```bash
+MIMOCA_GESTURE_MODEL_PATH=/full/path/to/hand_landmarker.task python3 python/service.py
+```
+
 ### 3) Run C++ app
 
 ```bash
@@ -65,7 +78,7 @@ The sidecar listens on `http://127.0.0.1:8080`.
 On startup, the app loads the sample recipe and then accepts these commands:
 - `current` → ask planner for current step
 - `next` → ask planner for next instruction (and advance if available)
-- `gesture <label> [confidence]` → run a gesture-only planner turn using one of: `next`, `repeat`, `option_a`, `option_b`, `none`
+- `gesture` → run a gesture-only planner turn using the latest camera frame and sidecar gesture detection
 - `stt-file ./path/to/audio.wav` → transcribe a buffered WAV clip using faster-whisper and run a planner turn
 - `stt-stream-file ./path/to/audio.wav` → stream WAV PCM to sidecar in ~20 ms chunks, use VAD speech-start to auto-stop TTS, and segment utterances on silence
 - `camera` → print camera status and latest frame summary
@@ -161,5 +174,6 @@ Expected: deterministic mock `PlannerResponse` JSON payload that can request ste
 - The sidecar exposes both buffered transcription (`/stt/transcribe`) and chunk-buffering endpoints (`/stt/session/start`, `/stt/session/chunk`, `/stt/session/finalize`) so partial/final transcript behavior can be added without redesigning the API.
 - The sidecar now includes lightweight RMS-based VAD in the chunk pipeline. When speech start is detected, the C++ app immediately interrupts TTS in streamed mode.
 - VAD segments utterances by detecting trailing silence. If VAD becomes unavailable (for example unsupported sample rate), interruption falls back to the manual `stop` command.
+- The sidecar now exposes `/gesture/detect`, backed by MediaPipe Hand Landmarker with a tiny heuristic classifier for `next`, `repeat`, `option_a`, `option_b`, `none`.
 - The sidecar boundary is intentionally small and logged to keep iteration fast.
 - Recipe parsing is intentionally minimal and currently targets one startup recipe.

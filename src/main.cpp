@@ -30,6 +30,7 @@
 
 #ifdef MIMOCA_HAS_OPENCV
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
 #endif
 
@@ -145,11 +146,6 @@ struct StreamingSttChunkResult {
     bool vad_available = true;
     std::string text;
     std::string error;
-};
-
-struct GestureCommand {
-    bool parsed = false;
-    Gesture gesture{"none", 0.0};
 };
 
 struct PlannerRoundTripStatus {
@@ -432,6 +428,35 @@ bool ExtractJsonFieldBool(const std::string& json, const std::string& field, con
         return false;
     }
     return default_value;
+}
+
+double ExtractJsonFieldDouble(const std::string& json, const std::string& field, const double default_value) {
+    const std::string key = "\"" + field + "\":";
+    const size_t key_pos = json.find(key);
+    if (key_pos == std::string::npos) {
+        return default_value;
+    }
+    size_t pos = key_pos + key.size();
+    while (pos < json.size() && json[pos] == ' ') {
+        ++pos;
+    }
+    size_t end = pos;
+    while (end < json.size()) {
+        const char c = json[end];
+        if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+') {
+            ++end;
+            continue;
+        }
+        break;
+    }
+    if (end <= pos) {
+        return default_value;
+    }
+    try {
+        return std::stod(json.substr(pos, end - pos));
+    } catch (const std::exception&) {
+        return default_value;
+    }
 }
 
 std::string Base64Encode(const std::vector<uint8_t>& data) {
@@ -1304,6 +1329,42 @@ SttResult FinalizeStreamingSttSession(const std::string& host, int port, const s
     return SttResult{true, ExtractJsonFieldString(response_body, "text"), true, ""};
 }
 
+bool RequestGestureDetection(const std::string& host,
+                             const int port,
+                             const std::vector<uint8_t>& jpeg_bytes,
+                             Gesture& out_gesture) {
+    if (jpeg_bytes.empty()) {
+        return false;
+    }
+    const std::string body =
+        "{\"image_base64\":\"" + Base64Encode(jpeg_bytes) + "\",\"image_format\":\"jpeg\"}";
+    const std::string request =
+        "POST /gesture/detect HTTP/1.1\r\n"
+        "Host: " +
+        host + "\r\n"
+               "Content-Type: application/json\r\n"
+               "Connection: close\r\n"
+               "Content-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    std::string response;
+    if (!SendHttpRequest(host, port, request, response)) {
+        return false;
+    }
+    const std::string response_body = ExtractHttpBody(response);
+    if (response.find("200 OK") == std::string::npos || response_body.empty()) {
+        return false;
+    }
+    const std::string gesture_object = ExtractJsonFieldObject(response_body, "gesture");
+    if (gesture_object.empty()) {
+        return false;
+    }
+    const std::string label = ExtractJsonFieldString(gesture_object, "label");
+    const double confidence = ExtractJsonFieldDouble(gesture_object, "confidence", 0.0);
+    out_gesture = Gesture{label.empty() ? "none" : label, std::clamp(confidence, 0.0, 1.0)};
+    return true;
+}
+
 std::string FormatDetectionsCompact(const std::vector<Detection>& detections) {
     if (detections.empty()) {
         return "[]";
@@ -1384,37 +1445,6 @@ PlannerResponse LocalRecipeFallback(const RecipeState& state, const std::string&
 
 bool IsSupportedGestureLabel(const std::string& label) {
     return label == "next" || label == "repeat" || label == "option_a" || label == "option_b" || label == "none";
-}
-
-GestureCommand ParseGestureCommand(const std::string& line) {
-    const std::string prefix = "gesture ";
-    if (line.rfind(prefix, 0) != 0) {
-        return GestureCommand{};
-    }
-
-    std::istringstream input(line.substr(prefix.size()));
-    std::string label;
-    input >> label;
-    label = ToLower(label);
-    if (!IsSupportedGestureLabel(label)) {
-        Log("Unsupported gesture label '" + label + "'. Use: next | repeat | option_a | option_b | none");
-        return GestureCommand{};
-    }
-
-    double confidence = 0.95;
-    if (input >> confidence) {
-        if (confidence < 0.0) {
-            confidence = 0.0;
-        }
-        if (confidence > 1.0) {
-            confidence = 1.0;
-        }
-    }
-
-    GestureCommand command{};
-    command.parsed = true;
-    command.gesture = Gesture{label, confidence};
-    return command;
 }
 
 class SpeechInputAdapter {
@@ -1599,6 +1629,20 @@ class CameraController {
         return snapshot_;
     }
 
+    bool TryEncodeLatestFrameJpeg(std::vector<uint8_t>& out_jpeg) const {
+#ifdef MIMOCA_HAS_OPENCV
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (latest_frame_.empty()) {
+            return false;
+        }
+        std::vector<int> encode_params{cv::IMWRITE_JPEG_QUALITY, 70};
+        return cv::imencode(".jpg", latest_frame_, out_jpeg, encode_params);
+#else
+        (void)out_jpeg;
+        return false;
+#endif
+    }
+
    private:
 #ifdef MIMOCA_HAS_OPENCV
     void CaptureLoop() {
@@ -1631,6 +1675,7 @@ class CameraController {
                 snapshot_.capture_timestamp = MakeIsoTimestampNow();
                 snapshot_.frame_count += 1;
                 snapshot_.status_message = "camera running";
+                latest_frame_ = frame.clone();
             }
 
             if (log_first_frame) {
@@ -1643,6 +1688,7 @@ class CameraController {
     mutable std::mutex mutex_;
     cv::VideoCapture capture_;
     std::thread capture_thread_;
+    cv::Mat latest_frame_;
     bool running_ = false;
 #else
     mutable std::mutex mutex_;
@@ -1691,7 +1737,7 @@ int main() {
     Log("Debug mode: " + std::string(debug_mode_enabled ? "enabled" : "disabled") +
         " (set MIMOCA_DEBUG=1 or use 'debug on').");
 
-    Log("Type 'current', 'next', 'camera', 'gesture <label> [confidence]', 'stt-file <wav_path>',");
+    Log("Type 'current', 'next', 'gesture', 'camera', 'stt-file <wav_path>',");
     Log("'stt-stream-file <wav_path>' (VAD + auto interrupt),");
     Log("'debug on|off|status', 'stop', or 'exit'.");
     std::string line;
@@ -1769,13 +1815,10 @@ int main() {
             utterance = "what is the current step?";
         } else if (line == "next") {
             utterance = "what next?";
-        } else if (const GestureCommand gesture_command = ParseGestureCommand(line); gesture_command.parsed) {
-            turn_gesture = gesture_command.gesture;
-            command = "gesture_" + turn_gesture.label;
-            Log("Mock gesture injected: label='" + turn_gesture.label + "', confidence=" +
-                std::to_string(turn_gesture.confidence));
+        } else if (line == "gesture") {
+            command = "gesture_detect";
         } else {
-            Log("Unknown command. Use: current | next | camera | gesture <label> [confidence] | stt-file <wav_path> | "
+            Log("Unknown command. Use: current | next | gesture | camera | stt-file <wav_path> | "
                 "stt-stream-file <wav_path> | debug on|off|status | stop | exit");
             continue;
         }
@@ -1789,8 +1832,22 @@ int main() {
             ApplyBranchSelection(recipe_state, detected_branch, turn_gesture.label == "none" ? "utterance" : "gesture");
         }
 
-        PlannerResponse response{};
         const CameraSnapshot camera_snapshot = camera.GetLatestSnapshot();
+        if (sidecar_ok) {
+            std::vector<uint8_t> latest_frame_jpeg;
+            if (camera.TryEncodeLatestFrameJpeg(latest_frame_jpeg)) {
+                Gesture detected_gesture{"none", 0.0};
+                if (RequestGestureDetection("127.0.0.1", 8080, latest_frame_jpeg, detected_gesture)) {
+                    if (IsSupportedGestureLabel(detected_gesture.label)) {
+                        turn_gesture = detected_gesture;
+                    }
+                } else {
+                    Log("Gesture detection unavailable for this turn; continuing with gesture='none'.");
+                }
+            }
+        }
+
+        PlannerResponse response{};
         const TurnContext turn_context = BuildTurnContext(recipe_state, utterance, turn_gesture, camera_snapshot);
         PlannerRoundTripStatus planner_status{};
         if (sidecar_ok) {

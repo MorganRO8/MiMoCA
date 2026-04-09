@@ -6,6 +6,7 @@ Endpoints:
 - POST /plan -> mock planner response JSON
 - POST /stt/transcribe -> faster-whisper transcription for buffered audio
 - POST /stt/session/start|chunk|finalize -> chunk buffering API for future streaming
+- POST /gesture/detect -> MediaPipe Hand Landmarker + tiny gesture mapping
 """
 
 from __future__ import annotations
@@ -23,13 +24,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass, field
 
 import numpy as np
+import cv2
+import mediapipe as mp
 from faster_whisper import WhisperModel
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
 HOST = "127.0.0.1"
 PORT = 8080
 DEFAULT_STT_MODEL = os.getenv("MIMOCA_STT_MODEL", "distil-large-v3")
 DEFAULT_STT_DEVICE = os.getenv("MIMOCA_STT_DEVICE", "cpu")
 DEFAULT_STT_COMPUTE_TYPE = os.getenv("MIMOCA_STT_COMPUTE_TYPE", "int8")
+DEFAULT_GESTURE_MODEL_PATH = os.getenv("MIMOCA_GESTURE_MODEL_PATH", "python/models/hand_landmarker.task")
 
 
 @dataclass
@@ -326,6 +332,145 @@ class FasterWhisperSpeechAdapter:
 SPEECH_ADAPTER = FasterWhisperSpeechAdapter()
 
 
+class MediaPipeGestureAdapter:
+    """Hand Landmarker + tiny fixed gesture vocabulary."""
+
+    SUPPORTED_LABELS = {"next", "repeat", "option_a", "option_b", "none"}
+
+    def __init__(self) -> None:
+        self.model_path = DEFAULT_GESTURE_MODEL_PATH
+        self.failure_reason = ""
+        self.landmarker: vision.HandLandmarker | None = None
+        self._init_landmarker()
+
+    def _init_landmarker(self) -> None:
+        if not os.path.exists(self.model_path):
+            self.failure_reason = "hand_landmarker_model_missing"
+            logging.warning("Gesture adapter disabled: model not found at %s", self.model_path)
+            return
+        try:
+            options = vision.HandLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=self.model_path),
+                num_hands=1,
+                min_hand_detection_confidence=0.4,
+                min_hand_presence_confidence=0.4,
+                min_tracking_confidence=0.4,
+            )
+            self.landmarker = vision.HandLandmarker.create_from_options(options)
+            logging.info("Gesture adapter ready with MediaPipe model: %s", self.model_path)
+        except Exception as exc:  # noqa: BLE001
+            self.failure_reason = "hand_landmarker_init_failed"
+            self.landmarker = None
+            logging.warning("Gesture adapter failed to initialize: %s", exc)
+
+    @staticmethod
+    def _decode_image(payload: dict) -> np.ndarray:
+        image_base64 = str(payload.get("image_base64", ""))
+        if not image_base64:
+            raise ValueError("image_base64_required")
+        try:
+            image_bytes = base64.b64decode(image_base64)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("invalid_image_base64") from exc
+        image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None or image.size == 0:
+            raise ValueError("invalid_image_bytes")
+        return image
+
+    @staticmethod
+    def _distance(a, b) -> float:
+        dx = float(a.x - b.x)
+        dy = float(a.y - b.y)
+        return float(np.sqrt(dx * dx + dy * dy))
+
+    @staticmethod
+    def _is_finger_extended(landmarks: list, tip_idx: int, pip_idx: int) -> bool:
+        return float(landmarks[tip_idx].y) < float(landmarks[pip_idx].y)
+
+    @staticmethod
+    def _is_thumb_extended(landmarks: list, handedness_name: str) -> bool:
+        thumb_tip = landmarks[4]
+        thumb_ip = landmarks[3]
+        if handedness_name.lower() == "left":
+            return float(thumb_tip.x) > float(thumb_ip.x)
+        return float(thumb_tip.x) < float(thumb_ip.x)
+
+    def _map_landmarks_to_label(self, landmarks: list, handedness_name: str, detection_score: float) -> dict:
+        thumb_extended = self._is_thumb_extended(landmarks, handedness_name)
+        index_extended = self._is_finger_extended(landmarks, 8, 6)
+        middle_extended = self._is_finger_extended(landmarks, 12, 10)
+        ring_extended = self._is_finger_extended(landmarks, 16, 14)
+        pinky_extended = self._is_finger_extended(landmarks, 20, 18)
+        extended_count = sum([thumb_extended, index_extended, middle_extended, ring_extended, pinky_extended])
+
+        pinch_distance = self._distance(landmarks[4], landmarks[8])
+        wrist_middle_distance = max(self._distance(landmarks[0], landmarks[12]), 0.01)
+        pinch_ratio = pinch_distance / wrist_middle_distance
+
+        label = "none"
+        heuristic_confidence = 0.15
+        if extended_count >= 4:
+            label = "next"
+            heuristic_confidence = 0.9
+        elif index_extended and middle_extended and not ring_extended and not pinky_extended:
+            label = "option_b"
+            heuristic_confidence = 0.82
+        elif index_extended and not middle_extended and not ring_extended and not pinky_extended:
+            label = "option_a"
+            heuristic_confidence = 0.78
+        elif pinch_ratio < 0.35:
+            label = "repeat"
+            heuristic_confidence = 0.75
+
+        confidence = max(0.0, min(1.0, (0.55 * detection_score) + (0.45 * heuristic_confidence)))
+        return {
+            "label": label,
+            "confidence": confidence,
+            "details": {
+                "extended_count": extended_count,
+                "pinch_ratio": pinch_ratio,
+                "handedness": handedness_name,
+            },
+        }
+
+    def detect(self, payload: dict) -> dict:
+        if self.landmarker is None:
+            return {
+                "gesture": {"label": "none", "confidence": 0.0},
+                "landmarker_available": False,
+                "error": self.failure_reason or "hand_landmarker_unavailable",
+            }
+
+        image = self._decode_image(payload)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        result = self.landmarker.detect(mp_image)
+
+        if not result.hand_landmarks:
+            return {"gesture": {"label": "none", "confidence": 0.0}, "landmarker_available": True, "hands_detected": 0}
+
+        landmarks = result.hand_landmarks[0]
+        handedness_name = "unknown"
+        detection_score = 0.0
+        if result.handedness and result.handedness[0]:
+            handedness = result.handedness[0][0]
+            handedness_name = str(getattr(handedness, "category_name", "unknown") or "unknown")
+            detection_score = float(getattr(handedness, "score", 0.0) or 0.0)
+        mapped = self._map_landmarks_to_label(landmarks, handedness_name, detection_score)
+        if mapped["label"] not in self.SUPPORTED_LABELS:
+            mapped["label"] = "none"
+            mapped["confidence"] = 0.0
+        return {
+            "gesture": {"label": mapped["label"], "confidence": mapped["confidence"]},
+            "landmarker_available": True,
+            "hands_detected": len(result.hand_landmarks),
+            "details": mapped["details"],
+        }
+
+
+GESTURE_ADAPTER = MediaPipeGestureAdapter()
+
+
 def _deterministic_mock_planner(turn_context: dict) -> dict:
     utterance = str(turn_context.get("user_utterance", "")).strip().lower()
     raw_utterance = str(turn_context.get("user_utterance", "")).strip()
@@ -461,6 +606,8 @@ class Handler(BaseHTTPRequestHandler):
                     "stt_model": SPEECH_ADAPTER.model_name,
                     "stt_device": SPEECH_ADAPTER.device,
                     "stt_compute_type": SPEECH_ADAPTER.compute_type,
+                    "gesture_landmarker_available": GESTURE_ADAPTER.landmarker is not None,
+                    "gesture_model_path": GESTURE_ADAPTER.model_path,
                 },
             )
             return
@@ -505,12 +652,23 @@ class Handler(BaseHTTPRequestHandler):
                 logging.info("stt finalize complete: session_id=%s chars=%d", result.get("session_id"), len(result.get("text", "")))
                 self._write_json(200, result)
                 return
+            if self.path == "/gesture/detect":
+                result = GESTURE_ADAPTER.detect(payload)
+                gesture = result.get("gesture", {})
+                logging.info(
+                    "gesture detect complete: label=%s confidence=%.2f hands=%s",
+                    gesture.get("label", "none"),
+                    float(gesture.get("confidence", 0.0) or 0.0),
+                    result.get("hands_detected", 0),
+                )
+                self._write_json(200, result)
+                return
         except ValueError as exc:
             self._write_json(400, {"error": str(exc)})
             return
         except Exception as exc:  # noqa: BLE001
-            logging.exception("stt endpoint failure: %s", exc)
-            self._write_json(500, {"error": "stt_failure", "detail": str(exc)})
+            logging.exception("sidecar endpoint failure: %s", exc)
+            self._write_json(500, {"error": "sidecar_failure", "detail": str(exc)})
             return
 
         self._write_json(404, {"error": "not_found", "path": self.path})
