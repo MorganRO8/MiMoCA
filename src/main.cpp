@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -116,6 +117,11 @@ struct RecipeState {
 struct TranscriptEvent {
     std::string text;
     bool is_final;
+};
+
+struct GestureCommand {
+    bool parsed = false;
+    Gesture gesture{"none", 0.0};
 };
 
 void Log(const std::string& message);
@@ -668,7 +674,7 @@ bool AdvanceCurrentStep(RecipeState& state) {
 
 TurnContext BuildTurnContext(const RecipeState& state,
                              const std::string& utterance,
-                             const std::string& gesture_label,
+                             const Gesture& gesture,
                              const CameraSnapshot& camera_snapshot) {
     const RecipeStep* current = GetCurrentStep(state);
     const RecipeStep* next = GetNextStep(state);
@@ -686,7 +692,7 @@ TurnContext BuildTurnContext(const RecipeState& state,
         utterance,
         current != nullptr ? current->instruction : "",
         next != nullptr ? next->instruction : "",
-        Gesture{gesture_label, 0.95},
+        gesture,
         std::vector<Detection>{Detection{"cutting_board", 0.88, {0.2, 0.2, 0.7, 0.8}}},
         HandPose{"unknown", 0.0},
         camera_snapshot.frame_available,
@@ -749,6 +755,11 @@ PlannerResponse LocalRecipeFallback(const RecipeState& state, const std::string&
     response.interruptible = true;
     response.advance_step = false;
 
+    if (ContainsText(normalized, "repeat")) {
+        response.assistant_text = current != nullptr ? "Repeat: " + current->instruction : "No current step available.";
+        return response;
+    }
+
     if (ContainsText(normalized, "current")) {
         response.assistant_text = current != nullptr ? "Current step: " + current->instruction : "No current step available.";
         return response;
@@ -764,19 +775,55 @@ PlannerResponse LocalRecipeFallback(const RecipeState& state, const std::string&
         return response;
     }
 
+    if (ContainsText(normalized, "option_a")) {
+        response.assistant_text = "Selected option A branch.";
+        response.new_branch_id = "option_a";
+        return response;
+    }
+
+    if (ContainsText(normalized, "option_b")) {
+        response.assistant_text = "Selected option B branch.";
+        response.new_branch_id = "option_b";
+        return response;
+    }
+
     response.assistant_text = "Say 'current' or 'next'.";
     return response;
 }
 
-std::string InferGestureLabelFromUtterance(const std::string& utterance) {
-    const std::string normalized = ToLower(utterance);
-    if (ContainsText(normalized, "next")) {
-        return "next";
+bool IsSupportedGestureLabel(const std::string& label) {
+    return label == "next" || label == "repeat" || label == "option_a" || label == "option_b" || label == "none";
+}
+
+GestureCommand ParseGestureCommand(const std::string& line) {
+    const std::string prefix = "gesture ";
+    if (line.rfind(prefix, 0) != 0) {
+        return GestureCommand{};
     }
-    if (ContainsText(normalized, "repeat")) {
-        return "repeat";
+
+    std::istringstream input(line.substr(prefix.size()));
+    std::string label;
+    input >> label;
+    label = ToLower(label);
+    if (!IsSupportedGestureLabel(label)) {
+        Log("Unsupported gesture label '" + label + "'. Use: next | repeat | option_a | option_b | none");
+        return GestureCommand{};
     }
-    return "none";
+
+    double confidence = 0.95;
+    if (input >> confidence) {
+        if (confidence < 0.0) {
+            confidence = 0.0;
+        }
+        if (confidence > 1.0) {
+            confidence = 1.0;
+        }
+    }
+
+    GestureCommand command{};
+    command.parsed = true;
+    command.gesture = Gesture{label, confidence};
+    return command;
 }
 
 class SpeechInputAdapter {
@@ -961,7 +1008,8 @@ int main() {
     camera.Start(0);
     Log("Speech input adapter: " + speech_input.Name());
 
-    Log("Type 'current', 'next', 'camera', 'stop' (cancel speech), 'say-partial <text>', 'say-final <text>', or 'exit'.");
+    Log("Type 'current', 'next', 'camera', 'gesture <label> [confidence]', 'stop',");
+    Log("'say-partial <text>', 'say-final <text>', or 'exit'.");
     std::string line;
     while (std::getline(std::cin, line)) {
         line = Trim(line);
@@ -993,6 +1041,7 @@ int main() {
 
         std::string utterance;
         std::string command = line;
+        Gesture turn_gesture{"none", 0.0};
         TranscriptEvent transcript_event{};
         if (speech_input.TryConsumeConsoleLine(line, transcript_event)) {
             if (transcript_event.text.empty()) {
@@ -1012,16 +1061,21 @@ int main() {
             utterance = "what is the current step?";
         } else if (line == "next") {
             utterance = "what next?";
+        } else if (const GestureCommand gesture_command = ParseGestureCommand(line); gesture_command.parsed) {
+            turn_gesture = gesture_command.gesture;
+            command = "gesture_" + turn_gesture.label;
+            Log("Mock gesture injected: label='" + turn_gesture.label + "', confidence=" +
+                std::to_string(turn_gesture.confidence));
         } else {
-            Log("Unknown command. Use: current | next | stop | say-partial <text> | say-final <text> | exit");
+            Log("Unknown command. Use: current | next | gesture <label> [confidence] | stop | "
+                "say-partial <text> | say-final <text> | exit");
             continue;
         }
 
         PlannerResponse response{};
         const CameraSnapshot camera_snapshot = camera.GetLatestSnapshot();
         if (sidecar_ok) {
-            const std::string gesture = InferGestureLabelFromUtterance(utterance);
-            if (!RequestMockPlanner("127.0.0.1", 8080, BuildTurnContext(recipe_state, utterance, gesture, camera_snapshot),
+            if (!RequestMockPlanner("127.0.0.1", 8080, BuildTurnContext(recipe_state, utterance, turn_gesture, camera_snapshot),
                                     response)) {
                 Log("Planner call failed; using local recipe fallback for this turn.");
                 response = LocalRecipeFallback(recipe_state, command);
