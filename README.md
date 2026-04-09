@@ -79,6 +79,14 @@ To choose a different model/device at startup:
 MIMOCA_STT_MODEL=large-v3 MIMOCA_STT_DEVICE=cpu python3 python/service.py
 ```
 
+To choose a Windows TTS voice (if installed and available):
+
+```bash
+MIMOCA_TTS_VOICE=Zira ./build/mimoca
+```
+
+`MIMOCA_TTS_VOICE` is matched against installed SAPI voice descriptions/token IDs. If no match is found, the app logs a fallback and uses the default system voice.
+
 Defaults:
 - `MIMOCA_STT_MODEL=distil-large-v3` (auto-fallback to `large-v3` if unavailable)
 - `MIMOCA_STT_DEVICE=cpu`

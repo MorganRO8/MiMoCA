@@ -2,6 +2,7 @@
 #include <chrono>
 #include <ctime>
 #include <cstdlib>
+#include <cwchar>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -174,7 +175,12 @@ void Log(const std::string& message);
 #ifdef _WIN32
 class TtsController {
    public:
-    TtsController() = default;
+    TtsController() {
+        const char* configured_voice = std::getenv("MIMOCA_TTS_VOICE");
+        if (configured_voice != nullptr) {
+            selected_voice_ = configured_voice;
+        }
+    }
 
     ~TtsController() {
         Stop();
@@ -188,22 +194,30 @@ class TtsController {
         Stop();
         stop_requested_ = false;
         speech_thread_ = std::thread([this, text]() {
-            Log("TTS start.");
+            Log("TTS start: " + text);
             const HRESULT init_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
             if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
                 Log("TTS unavailable: COM initialization failed.");
                 return;
             }
+            const bool should_uninitialize = SUCCEEDED(init_hr);
 
             ISpVoice* voice = nullptr;
             const HRESULT create_hr = CoCreateInstance(CLSID_SpVoice, nullptr, CLSCTX_ALL, IID_ISpVoice,
                                                        reinterpret_cast<void**>(&voice));
             if (FAILED(create_hr) || voice == nullptr) {
                 Log("TTS unavailable: cannot create SAPI voice.");
-                if (SUCCEEDED(init_hr)) {
+                if (should_uninitialize) {
                     CoUninitialize();
                 }
                 return;
+            }
+
+            ApplyVoiceSelection(voice);
+
+            {
+                std::lock_guard<std::mutex> lock(voice_mutex_);
+                active_voice_ = voice;
             }
 
             std::wstring wtext(text.begin(), text.end());
@@ -221,14 +235,17 @@ class TtsController {
             }
 
             if (stop_requested_) {
-                voice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
                 Log("TTS stop requested; speech canceled.");
             } else {
                 Log("TTS finished.");
             }
 
+            {
+                std::lock_guard<std::mutex> lock(voice_mutex_);
+                active_voice_ = nullptr;
+            }
             voice->Release();
-            if (SUCCEEDED(init_hr)) {
+            if (should_uninitialize) {
                 CoUninitialize();
             }
         });
@@ -241,12 +258,76 @@ class TtsController {
 
         Log("TTS stop requested.");
         stop_requested_ = true;
+        {
+            std::lock_guard<std::mutex> lock(voice_mutex_);
+            if (active_voice_ != nullptr) {
+                active_voice_->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
+            }
+        }
         speech_thread_.join();
     }
 
    private:
+    static std::string ToLowerCopy(std::string text) {
+        std::transform(text.begin(), text.end(), text.begin(), [](const unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return text;
+    }
+
+    void ApplyVoiceSelection(ISpVoice* voice) const {
+        if (selected_voice_.empty()) {
+            return;
+        }
+
+        IEnumSpObjectTokens* enum_tokens = nullptr;
+        if (FAILED(SpEnumTokens(SPCAT_VOICES, nullptr, nullptr, &enum_tokens)) || enum_tokens == nullptr) {
+            Log("TTS voice selection unavailable: could not enumerate installed voices.");
+            return;
+        }
+
+        const std::string wanted = ToLowerCopy(selected_voice_);
+        ISpObjectToken* matched_token = nullptr;
+        ULONG fetched = 0;
+        while (enum_tokens->Next(1, &matched_token, &fetched) == S_OK && matched_token != nullptr) {
+            wchar_t* description = nullptr;
+            std::string description_text;
+            if (SUCCEEDED(SpGetDescription(matched_token, &description)) && description != nullptr) {
+                description_text.assign(description, description + std::wcslen(description));
+                ::CoTaskMemFree(description);
+            }
+
+            wchar_t* token_id = nullptr;
+            std::string token_id_text;
+            if (SUCCEEDED(matched_token->GetId(&token_id)) && token_id != nullptr) {
+                token_id_text.assign(token_id, token_id + std::wcslen(token_id));
+                ::CoTaskMemFree(token_id);
+            }
+
+            const std::string haystack = ToLowerCopy(description_text + " " + token_id_text);
+            if (haystack.find(wanted) != std::string::npos) {
+                if (SUCCEEDED(voice->SetVoice(matched_token))) {
+                    Log("TTS voice selected: " + description_text);
+                } else {
+                    Log("TTS voice selection failed for: " + description_text);
+                }
+                matched_token->Release();
+                enum_tokens->Release();
+                return;
+            }
+
+            matched_token->Release();
+        }
+
+        enum_tokens->Release();
+        Log("TTS voice '" + selected_voice_ + "' not found; using default voice.");
+    }
+
     std::thread speech_thread_;
     std::atomic<bool> stop_requested_{false};
+    std::string selected_voice_;
+    ISpVoice* active_voice_ = nullptr;
+    std::mutex voice_mutex_;
 };
 #else
 class TtsController {
