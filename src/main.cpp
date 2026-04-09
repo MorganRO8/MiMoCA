@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -130,6 +131,24 @@ struct TranscriptEvent {
 struct GestureCommand {
     bool parsed = false;
     Gesture gesture{"none", 0.0};
+};
+
+struct PlannerRoundTripStatus {
+    bool attempted = false;
+    bool success = false;
+    bool used_fallback = false;
+    long long round_trip_ms = -1;
+    std::string source = "unknown";
+};
+
+struct DebugSnapshot {
+    std::string transcript = "(none)";
+    Gesture gesture{"none", 0.0};
+    std::vector<Detection> detections;
+    std::string recipe_id = "(none)";
+    std::string step_id = "(none)";
+    std::string branch_id = "(none)";
+    PlannerRoundTripStatus planner;
 };
 
 void Log(const std::string& message);
@@ -419,6 +438,14 @@ std::string ToLower(std::string text) {
 
 bool ContainsText(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
+}
+
+std::string EnvOrDefault(const char* name, const std::string& fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return fallback;
+    }
+    return value;
 }
 
 std::string Trim(const std::string& text) {
@@ -960,6 +987,35 @@ bool RequestMockPlanner(const std::string& host, int port, const TurnContext& tu
     return true;
 }
 
+std::string FormatDetectionsCompact(const std::vector<Detection>& detections) {
+    if (detections.empty()) {
+        return "[]";
+    }
+
+    std::string out = "[";
+    for (size_t i = 0; i < detections.size(); ++i) {
+        if (i > 0) {
+            out += ", ";
+        }
+        out += detections[i].label + "(" + std::to_string(detections[i].confidence) + ")";
+    }
+    out += "]";
+    return out;
+}
+
+void PrintDebugSnapshot(const DebugSnapshot& snapshot) {
+    std::cout << "[MiMoCA][debug] transcript=\"" << snapshot.transcript << "\"\n";
+    std::cout << "[MiMoCA][debug] gesture=" << snapshot.gesture.label << " (" << snapshot.gesture.confidence << ")\n";
+    std::cout << "[MiMoCA][debug] detections=" << FormatDetectionsCompact(snapshot.detections) << '\n';
+    std::cout << "[MiMoCA][debug] state=recipe:" << snapshot.recipe_id << " step:" << snapshot.step_id
+              << " branch:" << snapshot.branch_id << '\n';
+    std::cout << "[MiMoCA][debug] planner=source:" << snapshot.planner.source
+              << " attempted:" << (snapshot.planner.attempted ? "true" : "false")
+              << " success:" << (snapshot.planner.success ? "true" : "false")
+              << " fallback:" << (snapshot.planner.used_fallback ? "true" : "false")
+              << " round_trip_ms:" << snapshot.planner.round_trip_ms << '\n';
+}
+
 void PrintPlannerResponse(const PlannerResponse& response) {
     Log("Planner response parsed:");
     std::cout << "  assistant_text: " << response.assistant_text << '\n';
@@ -1223,10 +1279,18 @@ int main() {
     TtsController tts;
     MockTranscriptInputAdapter speech_input;
     CameraController camera;
+    bool debug_mode_enabled = false;
+    const std::string debug_env = ToLower(Trim(EnvOrDefault("MIMOCA_DEBUG", "0")));
+    if (debug_env == "1" || debug_env == "true" || debug_env == "on") {
+        debug_mode_enabled = true;
+    }
+    DebugSnapshot debug_snapshot{};
     camera.Start(0);
     Log("Speech input adapter: " + speech_input.Name());
+    Log("Debug mode: " + std::string(debug_mode_enabled ? "enabled" : "disabled") +
+        " (set MIMOCA_DEBUG=1 or use 'debug on').");
 
-    Log("Type 'current', 'next', 'camera', 'gesture <label> [confidence]', 'stop',");
+    Log("Type 'current', 'next', 'camera', 'gesture <label> [confidence]', 'debug on|off|status', 'stop',");
     Log("'say-partial <text>', 'say-final <text>', or 'exit'.");
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -1241,6 +1305,24 @@ int main() {
 
         if (line == "stop") {
             tts.Stop();
+            continue;
+        }
+
+        if (line == "debug on") {
+            debug_mode_enabled = true;
+            Log("Debug mode enabled.");
+            continue;
+        }
+
+        if (line == "debug off") {
+            debug_mode_enabled = false;
+            Log("Debug mode disabled.");
+            continue;
+        }
+
+        if (line == "debug status") {
+            Log("Debug mode is " + std::string(debug_mode_enabled ? "enabled" : "disabled") + ".");
+            PrintDebugSnapshot(debug_snapshot);
             continue;
         }
 
@@ -1271,8 +1353,13 @@ int main() {
                 utterance = transcript_event.text;
                 command = utterance;
                 Log("Speech final transcript: '" + utterance + "'");
+                debug_snapshot.transcript = utterance;
             } else {
                 Log("Speech partial transcript: '" + transcript_event.text + "'");
+                debug_snapshot.transcript = "(partial) " + transcript_event.text;
+                if (debug_mode_enabled) {
+                    PrintDebugSnapshot(debug_snapshot);
+                }
                 continue;
             }
         } else if (line == "current") {
@@ -1285,9 +1372,13 @@ int main() {
             Log("Mock gesture injected: label='" + turn_gesture.label + "', confidence=" +
                 std::to_string(turn_gesture.confidence));
         } else {
-            Log("Unknown command. Use: current | next | gesture <label> [confidence] | stop | "
+            Log("Unknown command. Use: current | next | camera | gesture <label> [confidence] | debug on|off|status | stop | "
                 "say-partial <text> | say-final <text> | exit");
             continue;
+        }
+
+        if (!utterance.empty()) {
+            debug_snapshot.transcript = utterance;
         }
 
         if (const std::string detected_branch = ResolveBranchSelection(recipe_state, utterance, turn_gesture);
@@ -1297,14 +1388,33 @@ int main() {
 
         PlannerResponse response{};
         const CameraSnapshot camera_snapshot = camera.GetLatestSnapshot();
+        const TurnContext turn_context = BuildTurnContext(recipe_state, utterance, turn_gesture, camera_snapshot);
+        PlannerRoundTripStatus planner_status{};
         if (sidecar_ok) {
-            if (!RequestMockPlanner("127.0.0.1", 8080, BuildTurnContext(recipe_state, utterance, turn_gesture, camera_snapshot),
-                                    response)) {
+            planner_status.attempted = true;
+            planner_status.source = "python_sidecar";
+            const auto planner_start = std::chrono::steady_clock::now();
+            if (!RequestMockPlanner("127.0.0.1", 8080, turn_context, response)) {
+                const auto planner_end = std::chrono::steady_clock::now();
+                planner_status.round_trip_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(planner_end - planner_start).count();
+                planner_status.success = false;
+                planner_status.used_fallback = true;
                 Log("Planner call failed; using local recipe fallback for this turn.");
                 response = LocalRecipeFallback(recipe_state, command);
+                planner_status.source = "local_fallback_after_sidecar_error";
+            } else {
+                const auto planner_end = std::chrono::steady_clock::now();
+                planner_status.round_trip_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(planner_end - planner_start).count();
+                planner_status.success = true;
             }
         } else {
             response = LocalRecipeFallback(recipe_state, command);
+            planner_status.attempted = false;
+            planner_status.success = true;
+            planner_status.used_fallback = true;
+            planner_status.source = "local_fallback_sidecar_unavailable";
         }
 
         if (!response.new_branch_id.empty()) {
@@ -1334,6 +1444,18 @@ int main() {
             } else {
                 Log("No next step to advance to.");
             }
+        }
+
+        const RecipeStep* debug_current_step = GetCurrentStep(recipe_state);
+        debug_snapshot.gesture = turn_gesture;
+        debug_snapshot.detections = turn_context.detections;
+        debug_snapshot.recipe_id = recipe_state.recipe.id;
+        debug_snapshot.step_id = debug_current_step != nullptr ? debug_current_step->id : "(none)";
+        debug_snapshot.branch_id =
+            recipe_state.selected_branch_by_point.empty() ? "(none)" : recipe_state.selected_branch_by_point.begin()->second;
+        debug_snapshot.planner = planner_status;
+        if (debug_mode_enabled) {
+            PrintDebugSnapshot(debug_snapshot);
         }
     }
 

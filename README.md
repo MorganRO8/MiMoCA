@@ -26,6 +26,7 @@ The C++ app now runs a tiny end-to-end path:
 10. select and persist branch choices from utterance (`rice cooker` / `pot`) or gestures (`option_a` / `option_b`)
 11. advance local step if `advance_step` is true, using branch-specific next-step routing when a branch is selected
 12. start camera capture on device `0` and keep a latest-frame summary (availability, width/height, timestamp, frame count) for planner turns
+13. optionally emit compact debug snapshots (transcript, gesture, detections, recipe/step/branch, planner round-trip status)
 
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
 The C++ app also logs camera lifecycle events (start/stop/first-frame availability).
@@ -64,9 +65,11 @@ On startup, the app loads the sample recipe and then accepts these commands:
 - `say-partial <text>` → emit a mock partial transcript event (logged only)
 - `say-final <text>` → emit a mock final transcript event and run a planner turn with that utterance
 - `stop` → cancel current TTS playback (temporary manual interruption control)
+- `debug on` / `debug off` / `debug status` → enable, disable, or print compact debug state
 - `exit` → quit
 
 If OpenCV is available at build time, camera capture is enabled automatically. If OpenCV is not found, the app stays in graceful camera-disabled mode and still runs speech + planner flow.
+Debug mode is disabled by default and can also be enabled at startup with `MIMOCA_DEBUG=1 ./build/mimoca`.
 
 ## Manual health-path testing
 
