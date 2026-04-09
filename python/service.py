@@ -16,12 +16,15 @@ import logging
 import base64
 import io
 import os
+import re
 import uuid
 import wave
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass, field
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import numpy as np
 import cv2
@@ -39,6 +42,14 @@ DEFAULT_STT_COMPUTE_TYPE = os.getenv("MIMOCA_STT_COMPUTE_TYPE", "int8")
 DEFAULT_GESTURE_MODEL_PATH = os.getenv("MIMOCA_GESTURE_MODEL_PATH", "python/models/hand_landmarker.task")
 DEFAULT_VISION_MODEL = os.getenv("MIMOCA_VISION_MODEL", "yolov8s-worldv2.pt")
 DEFAULT_VISION_CONFIDENCE = float(os.getenv("MIMOCA_VISION_CONFIDENCE", "0.25"))
+DEFAULT_PLANNER_MODE = os.getenv("MIMOCA_PLANNER_MODE", "mock").strip().lower()
+DEFAULT_LLM_PROVIDER = os.getenv("MIMOCA_LLM_PROVIDER", "openai_compatible").strip().lower()
+DEFAULT_LLM_BASE_URL = os.getenv("MIMOCA_LLM_BASE_URL", "https://api.openai.com/v1").strip()
+DEFAULT_LLM_MODEL = os.getenv("MIMOCA_LLM_MODEL", "gpt-4o-mini").strip()
+DEFAULT_LLM_API_KEY = os.getenv("MIMOCA_LLM_API_KEY", "").strip()
+DEFAULT_LLM_TIMEOUT_S = float(os.getenv("MIMOCA_LLM_TIMEOUT_S", "12"))
+DEFAULT_LLM_TEMPERATURE = float(os.getenv("MIMOCA_LLM_TEMPERATURE", "0.2"))
+DEFAULT_LLM_MAX_OUTPUT_CHARS = int(os.getenv("MIMOCA_LLM_MAX_OUTPUT_CHARS", "220"))
 FIXED_VOCABULARY = ["onion", "knife", "cutting board", "pot", "pan", "bowl", "spoon", "rice cooker"]
 
 
@@ -552,6 +563,181 @@ class YoloVisionAdapter:
 VISION_ADAPTER = YoloVisionAdapter()
 
 
+def _constrain_assistant_text(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if not normalized:
+        return "I can help with the current step. Ask what to do next."
+    if len(normalized) > DEFAULT_LLM_MAX_OUTPUT_CHARS:
+        normalized = normalized[: DEFAULT_LLM_MAX_OUTPUT_CHARS].rstrip(" ,;:")
+        if normalized and normalized[-1] not in ".!?":
+            normalized += "."
+    return normalized
+
+
+def _coerce_planner_response(candidate: dict) -> dict:
+    ui_overlays = candidate.get("ui_overlays", [])
+    if not isinstance(ui_overlays, list):
+        ui_overlays = []
+    return {
+        "assistant_text": _constrain_assistant_text(str(candidate.get("assistant_text", ""))),
+        "speak": bool(candidate.get("speak", True)),
+        "interruptible": bool(candidate.get("interruptible", True)),
+        "advance_step": bool(candidate.get("advance_step", False)),
+        "new_branch_id": candidate.get("new_branch_id") if candidate.get("new_branch_id") is not None else None,
+        "ui_overlays": ui_overlays,
+    }
+
+
+class LlmPlannerAdapter:
+    """Provider-agnostic planner boundary with openai-compatible HTTP support."""
+
+    def __init__(self) -> None:
+        self.mode = DEFAULT_PLANNER_MODE if DEFAULT_PLANNER_MODE in {"mock", "llm"} else "mock"
+        self.provider = DEFAULT_LLM_PROVIDER
+        self.base_url = DEFAULT_LLM_BASE_URL.rstrip("/")
+        self.model = DEFAULT_LLM_MODEL
+        self.api_key = DEFAULT_LLM_API_KEY
+        self.timeout_s = DEFAULT_LLM_TIMEOUT_S
+        self.temperature = DEFAULT_LLM_TEMPERATURE
+
+    @property
+    def llm_ready(self) -> bool:
+        if self.mode != "llm":
+            return False
+        return bool(self.api_key) and bool(self.model) and self.provider == "openai_compatible"
+
+    @staticmethod
+    def _compact_context(turn_context: dict) -> dict:
+        detections = turn_context.get("detections", [])
+        if not isinstance(detections, list):
+            detections = []
+        compact_detections = []
+        for det in detections[:8]:
+            if not isinstance(det, dict):
+                continue
+            compact_detections.append(
+                {
+                    "label": str(det.get("label", "")).strip(),
+                    "confidence": float(det.get("confidence", 0.0) or 0.0),
+                }
+            )
+        return {
+            "timestamp": turn_context.get("timestamp"),
+            "recipe_id": turn_context.get("recipe_id"),
+            "step_id": turn_context.get("step_id"),
+            "branch_id": turn_context.get("branch_id"),
+            "current_step_instruction": turn_context.get("current_step_instruction"),
+            "next_step_instruction": turn_context.get("next_step_instruction"),
+            "user_utterance": turn_context.get("user_utterance"),
+            "gesture": turn_context.get("gesture", {}),
+            "detections": compact_detections,
+            "frame_summary": turn_context.get("frame_summary", ""),
+            "frame_available": bool(turn_context.get("frame_available", False)),
+            "settings": turn_context.get("settings", {}),
+        }
+
+    @staticmethod
+    def _extract_json_object(text: str) -> dict:
+        stripped = text.strip()
+        if not stripped:
+            raise ValueError("empty_llm_response")
+        if stripped.startswith("```"):
+            stripped = stripped.strip("`")
+            if stripped.lower().startswith("json"):
+                stripped = stripped[4:].strip()
+        first = stripped.find("{")
+        last = stripped.rfind("}")
+        if first < 0 or last < 0 or last <= first:
+            raise ValueError("llm_response_not_json")
+        return json.loads(stripped[first : last + 1])
+
+    def _build_messages(self, turn_context: dict) -> list[dict]:
+        system_message = (
+            "You are a concise cooking planner for a hands-free assistant. "
+            "Return only strict JSON matching PlannerResponse. "
+            "assistant_text must be short and spoken-friendly. "
+            "Do not claim uncertain detections as facts."
+        )
+        user_payload = {
+            "planner_contract": {
+                "assistant_text": "string",
+                "speak": "boolean",
+                "interruptible": "boolean",
+                "advance_step": "boolean",
+                "new_branch_id": "string|null",
+                "ui_overlays": [{"type": "highlight_label", "target": "string"}],
+            },
+            "turn_context": self._compact_context(turn_context),
+            "rules": {
+                "max_assistant_chars": DEFAULT_LLM_MAX_OUTPUT_CHARS,
+                "set_advance_step_true_only_when_explicitly_advancing": True,
+            },
+        }
+        return [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": json.dumps(user_payload, separators=(",", ":"))},
+        ]
+
+    def _invoke_openai_compatible(self, messages: list[dict]) -> dict:
+        if not self.api_key:
+            raise RuntimeError("llm_api_key_missing")
+        url = f"{self.base_url}/chat/completions"
+        req_payload = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "response_format": {"type": "json_object"},
+            "messages": messages,
+        }
+        req = urllib_request.Request(
+            url=url,
+            data=json.dumps(req_payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=self.timeout_s) as resp:
+                body = resp.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"llm_http_error:{exc.code}:{detail[:220]}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"llm_request_failed:{exc}") from exc
+
+        parsed = json.loads(body)
+        choices = parsed.get("choices", [])
+        if not choices:
+            raise RuntimeError("llm_empty_choices")
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        if not isinstance(content, str):
+            raise RuntimeError("llm_invalid_content")
+        logging.info("planner llm raw response: %s", content)
+        return self._extract_json_object(content)
+
+    def plan(self, turn_context: dict) -> dict:
+        if not self.llm_ready:
+            raise RuntimeError("llm_not_ready")
+        compact = self._compact_context(turn_context)
+        logging.info(
+            "planner llm request: provider=%s model=%s payload=%s",
+            self.provider,
+            self.model,
+            json.dumps(compact, separators=(",", ":")),
+        )
+        messages = self._build_messages(turn_context)
+        if self.provider == "openai_compatible":
+            return _coerce_planner_response(self._invoke_openai_compatible(messages))
+        raise RuntimeError(f"unsupported_llm_provider:{self.provider}")
+
+
+PLANNER_ADAPTER = LlmPlannerAdapter()
+
+
 def _deterministic_mock_planner(turn_context: dict) -> dict:
     utterance = str(turn_context.get("user_utterance", "")).strip().lower()
     raw_utterance = str(turn_context.get("user_utterance", "")).strip()
@@ -663,6 +849,23 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
     }
 
 
+def _planner_with_fallback(turn_context: dict) -> dict:
+    if PLANNER_ADAPTER.mode != "llm":
+        return _deterministic_mock_planner(turn_context)
+    try:
+        response = PLANNER_ADAPTER.plan(turn_context)
+        logging.info("planner llm structured response: %s", json.dumps(response, separators=(",", ":")))
+        return response
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("planner llm failed, falling back to mock planner: %s", exc)
+        fallback = _deterministic_mock_planner(turn_context)
+        fallback["assistant_text"] = _constrain_assistant_text(
+            f"Planner fallback active. {fallback.get('assistant_text', '')}"
+        )
+        fallback.setdefault("ui_overlays", []).append({"type": "planner_fallback", "target": "mock"})
+        return fallback
+
+
 class Handler(BaseHTTPRequestHandler):
     def _write_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -692,6 +895,9 @@ class Handler(BaseHTTPRequestHandler):
                     "vision_available": VISION_ADAPTER.model is not None,
                     "vision_model": VISION_ADAPTER.model_name,
                     "vision_vocabulary": VISION_ADAPTER.vocabulary,
+                    "planner_mode": PLANNER_ADAPTER.mode,
+                    "planner_provider": PLANNER_ADAPTER.provider,
+                    "planner_llm_ready": PLANNER_ADAPTER.llm_ready,
                 },
             )
             return
@@ -712,7 +918,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/plan":
             logging.info("serialized TurnContext request: %s", json.dumps(payload, separators=(",", ":")))
             logging.info("planner received user_utterance: %s", payload.get("user_utterance", ""))
-            planner_response = _deterministic_mock_planner(payload)
+            planner_response = _planner_with_fallback(payload)
             if planner_response.get("new_branch_id"):
                 logging.info("planner branch selection: %s", planner_response.get("new_branch_id"))
             logging.info("serialized PlannerResponse response: %s", json.dumps(planner_response, separators=(",", ":")))
