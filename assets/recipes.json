@@ -1,0 +1,36 @@
+{
+  "recipes": [
+    {
+      "id": "demo_omelet",
+      "name": "Simple Omelet",
+      "ingredients": ["eggs", "salt", "butter"],
+      "tools": ["bowl", "fork", "pan"],
+      "steps": [
+        {
+          "id": "step_1",
+          "instruction": "Crack two eggs into a bowl and whisk with a pinch of salt.",
+          "next_step_id": "step_2",
+          "branch_point_id": null
+        },
+        {
+          "id": "step_2",
+          "instruction": "Heat butter in a pan over medium heat and pour in the eggs.",
+          "next_step_id": "step_3",
+          "branch_point_id": "doneness_choice"
+        },
+        {
+          "id": "step_3",
+          "instruction": "Fold when mostly set, then serve.",
+          "next_step_id": null,
+          "branch_point_id": null
+        }
+      ],
+      "branch_points": [
+        {
+          "id": "doneness_choice",
+          "options": ["soft", "firm"]
+        }
+      ]
+    }
+  ]
+}

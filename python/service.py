@@ -20,19 +20,38 @@ PORT = 8080
 def _deterministic_mock_planner(turn_context: dict) -> dict:
     utterance = str(turn_context.get("user_utterance", "")).strip().lower()
     gesture_label = str(turn_context.get("gesture", {}).get("label", "none")).strip().lower()
+    current_step_instruction = str(turn_context.get("current_step_instruction", "")).strip()
+    next_step_instruction = str(turn_context.get("next_step_instruction", "")).strip()
 
-    if "what next" in utterance or gesture_label == "next":
-        assistant_text = "Next, chop the onion into small pieces on the cutting board."
-        advance_step = True
-        target = "onion"
+    if "current step" in utterance:
+        assistant_text = (
+            f"Current step: {current_step_instruction}"
+            if current_step_instruction
+            else "Current step is not available."
+        )
+        advance_step = False
+        target = "current_step"
+    elif "what next" in utterance or gesture_label == "next":
+        if next_step_instruction:
+            assistant_text = f"Next instruction: {next_step_instruction}"
+            advance_step = True
+            target = "next_step"
+        else:
+            assistant_text = "You are at the final step."
+            advance_step = False
+            target = "recipe_complete"
     elif "repeat" in utterance or gesture_label == "repeat":
-        assistant_text = "Repeat: chop the onion into small pieces on the cutting board."
+        assistant_text = (
+            f"Repeat: {current_step_instruction}"
+            if current_step_instruction
+            else "I do not have a step to repeat yet."
+        )
         advance_step = False
-        target = "cutting_board"
+        target = "current_step"
     else:
-        assistant_text = "Mock planner ready. Ask 'what next?' or say 'repeat'."
+        assistant_text = "Mock planner ready. Ask for 'current step' or 'what next?'."
         advance_step = False
-        target = "knife"
+        target = "recipe"
 
     return {
         "assistant_text": assistant_text,

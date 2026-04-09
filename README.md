@@ -11,13 +11,15 @@ This repo now includes:
 - Python sidecar (`python/service.py`) with:
   - `GET /health`
   - `POST /plan` mock planner using the canonical `TurnContext` and `PlannerResponse` contracts
+- Recipe asset file (`assets/recipes.json`) with one sample recipe and a future branch point shape
 
 The C++ app now runs a tiny end-to-end path:
-1. health-check sidecar
-2. construct a sample `TurnContext`
-3. serialize and send it to `POST /plan`
-4. parse `PlannerResponse`
-5. print the returned planner fields
+1. load one recipe from `assets/recipes.json`
+2. track current step in memory
+3. health-check sidecar
+4. send turn context to `POST /plan` for `current` and `next` queries
+5. parse `PlannerResponse`
+6. advance local step if `advance_step` is true
 
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
 
@@ -46,7 +48,10 @@ The sidecar listens on `http://127.0.0.1:8080`.
 ./build/mimoca
 ```
 
-On startup, the app checks `http://127.0.0.1:8080/health` and then exercises the sample planner call if available.
+On startup, the app loads the sample recipe and then accepts these commands:
+- `current` → ask planner for current step
+- `next` → ask planner for next instruction (and advance if available)
+- `exit` → quit
 
 ## Manual health-path testing
 
@@ -58,7 +63,7 @@ curl http://127.0.0.1:8080/health
 
 Expected: JSON with `status: "ok"`.
 
-### Canonical mock planner path
+### Planner path with recipe step context
 
 ```bash
 curl -X POST http://127.0.0.1:8080/plan \
@@ -69,6 +74,8 @@ curl -X POST http://127.0.0.1:8080/plan \
     "step_id": "step_1",
     "branch_id": null,
     "user_utterance": "what next?",
+    "current_step_instruction": "Crack two eggs into a bowl and whisk with a pinch of salt.",
+    "next_step_instruction": "Heat butter in a pan over medium heat and pour in the eggs.",
     "gesture": {"label": "next", "confidence": 0.98},
     "detections": [{"label": "knife", "confidence": 0.93, "bbox": [0.1, 0.2, 0.3, 0.4]}],
     "hand_pose": {"label": "safe_claw", "confidence": 0.87},
@@ -81,9 +88,10 @@ curl -X POST http://127.0.0.1:8080/plan \
   }'
 ```
 
-Expected: deterministic mock `PlannerResponse` JSON payload.
+Expected: deterministic mock `PlannerResponse` JSON payload that can request step advancement.
 
 ## Notes
 
 - No real model integrations are included yet.
 - The sidecar boundary is intentionally small and logged to keep iteration fast.
+- Recipe parsing is intentionally minimal and currently targets one startup recipe.
