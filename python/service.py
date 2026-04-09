@@ -21,10 +21,44 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
     utterance = str(turn_context.get("user_utterance", "")).strip().lower()
     raw_utterance = str(turn_context.get("user_utterance", "")).strip()
     gesture_label = str(turn_context.get("gesture", {}).get("label", "none")).strip().lower()
+    try:
+        gesture_confidence = float(turn_context.get("gesture", {}).get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        gesture_confidence = 0.0
     current_step_instruction = str(turn_context.get("current_step_instruction", "")).strip()
     next_step_instruction = str(turn_context.get("next_step_instruction", "")).strip()
+    gesture_present = gesture_label in {"next", "repeat", "option_a", "option_b"} and gesture_confidence > 0.0
 
-    if "current step" in utterance:
+    if gesture_present and gesture_label == "next":
+        if next_step_instruction:
+            assistant_text = f"Gesture next: {next_step_instruction}"
+            advance_step = True
+            target = "next_step"
+        else:
+            assistant_text = "Gesture next received, but you are at the final step."
+            advance_step = False
+            target = "recipe_complete"
+        new_branch_id = None
+    elif gesture_present and gesture_label == "repeat":
+        assistant_text = (
+            f"Gesture repeat: {current_step_instruction}"
+            if current_step_instruction
+            else "Gesture repeat received, but current step is unavailable."
+        )
+        advance_step = False
+        target = "current_step"
+        new_branch_id = None
+    elif gesture_present and gesture_label == "option_a":
+        assistant_text = "Gesture selected option A branch."
+        advance_step = False
+        target = "branch_option_a"
+        new_branch_id = "option_a"
+    elif gesture_present and gesture_label == "option_b":
+        assistant_text = "Gesture selected option B branch."
+        advance_step = False
+        target = "branch_option_b"
+        new_branch_id = "option_b"
+    elif "current step" in utterance:
         assistant_text = (
             f"Current step: {current_step_instruction}"
             if current_step_instruction
@@ -32,6 +66,7 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
         )
         advance_step = False
         target = "current_step"
+        new_branch_id = None
     elif "what next" in utterance or gesture_label == "next":
         if next_step_instruction:
             assistant_text = f"Next instruction: {next_step_instruction}"
@@ -41,6 +76,7 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
             assistant_text = "You are at the final step."
             advance_step = False
             target = "recipe_complete"
+        new_branch_id = None
     elif "repeat" in utterance or gesture_label == "repeat":
         assistant_text = (
             f"Repeat: {current_step_instruction}"
@@ -49,22 +85,24 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
         )
         advance_step = False
         target = "current_step"
+        new_branch_id = None
     else:
         if raw_utterance:
             assistant_text = (
                 f"I heard: '{raw_utterance}'. Ask for 'current step' or 'what next?'."
             )
         else:
-            assistant_text = "Mock planner ready. Ask for 'current step' or 'what next?'."
+            assistant_text = "Mock planner ready. Use voice or gesture: next, repeat, option_a, option_b."
         advance_step = False
         target = "recipe"
+        new_branch_id = None
 
     return {
         "assistant_text": assistant_text,
         "speak": True,
         "interruptible": True,
         "advance_step": advance_step,
-        "new_branch_id": None,
+        "new_branch_id": new_branch_id,
         "ui_overlays": [{"type": "highlight_label", "target": target}],
     }
 
