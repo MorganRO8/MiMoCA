@@ -183,6 +183,33 @@ Expected: deterministic mock `PlannerResponse` JSON payload that can request ste
 - VAD segments utterances by detecting trailing silence. If VAD becomes unavailable (for example unsupported sample rate), interruption falls back to the manual `stop` command.
 - The sidecar now exposes `/gesture/detect`, backed by MediaPipe Hand Landmarker with a tiny heuristic classifier for `next`, `repeat`, `option_a`, `option_b`, `none`.
 - The sidecar now exposes `/vision/detect`, backed by Ultralytics YOLO and constrained to a small fixed cooking vocabulary. The C++ app sends the latest camera frame, receives detections (`label`, `confidence`, `bbox`), and forwards them in `TurnContext`.
+- The planner now supports two modes: `mock` (deterministic existing behavior) and `llm` (real provider-backed planner with structured JSON output and mock fallback).
 - If the YOLO model path points to an ONNX model, Ultralytics can run it with ONNX Runtime (`onnxruntime` dependency included).
 - The sidecar boundary is intentionally small and logged to keep iteration fast.
 - Recipe parsing is intentionally minimal and currently targets one startup recipe.
+
+## Real LLM planner mode
+
+By default, planner mode remains mock:
+
+```bash
+MIMOCA_PLANNER_MODE=mock python3 python/service.py
+```
+
+Enable real LLM planning (OpenAI-compatible HTTP API):
+
+```bash
+MIMOCA_PLANNER_MODE=llm \
+MIMOCA_LLM_PROVIDER=openai_compatible \
+MIMOCA_LLM_BASE_URL=https://api.openai.com/v1 \
+MIMOCA_LLM_MODEL=gpt-4o-mini \
+MIMOCA_LLM_API_KEY=YOUR_KEY \
+python3 python/service.py
+```
+
+Optional planner controls:
+- `MIMOCA_LLM_TIMEOUT_S` (default `12`)
+- `MIMOCA_LLM_TEMPERATURE` (default `0.2`)
+- `MIMOCA_LLM_MAX_OUTPUT_CHARS` (default `220`)
+
+The `/health` payload reports `planner_mode`, `planner_provider`, and `planner_llm_ready`.
