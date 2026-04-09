@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -126,6 +127,13 @@ struct RecipeState {
 struct TranscriptEvent {
     std::string text;
     bool is_final;
+};
+
+struct SttResult {
+    bool ok = false;
+    std::string text;
+    bool is_final = true;
+    std::string error;
 };
 
 struct GestureCommand {
@@ -316,6 +324,46 @@ std::string ExtractJsonFieldString(const std::string& json, const std::string& f
     return result;
 }
 
+bool ExtractJsonFieldBool(const std::string& json, const std::string& field, const bool default_value) {
+    const std::string key = "\"" + field + "\":";
+    const size_t key_pos = json.find(key);
+    if (key_pos == std::string::npos) {
+        return default_value;
+    }
+    size_t pos = key_pos + key.size();
+    while (pos < json.size() && json[pos] == ' ') {
+        ++pos;
+    }
+    if (json.compare(pos, 4, "true") == 0) {
+        return true;
+    }
+    if (json.compare(pos, 5, "false") == 0) {
+        return false;
+    }
+    return default_value;
+}
+
+std::string Base64Encode(const std::vector<uint8_t>& data) {
+    static constexpr char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((data.size() + 2) / 3) * 4);
+
+    for (size_t i = 0; i < data.size(); i += 3) {
+        const uint32_t octet_a = data[i];
+        const uint32_t octet_b = (i + 1 < data.size()) ? data[i + 1] : 0;
+        const uint32_t octet_c = (i + 2 < data.size()) ? data[i + 2] : 0;
+        const uint32_t triple = (octet_a << 16U) | (octet_b << 8U) | octet_c;
+
+        out.push_back(kTable[(triple >> 18U) & 0x3FU]);
+        out.push_back(kTable[(triple >> 12U) & 0x3FU]);
+        out.push_back((i + 1 < data.size()) ? kTable[(triple >> 6U) & 0x3FU] : '=');
+        out.push_back((i + 2 < data.size()) ? kTable[triple & 0x3FU] : '=');
+    }
+
+    return out;
+}
+
 std::string ExtractJsonFieldObject(const std::string& json, const std::string& field) {
     const std::string key = "\"" + field + "\":";
     const size_t key_pos = json.find(key);
@@ -406,27 +454,6 @@ std::unordered_map<std::string, std::string> ExtractJsonStringMap(const std::str
     }
 
     return values;
-}
-
-bool ExtractJsonFieldBool(const std::string& json, const std::string& field, bool default_value = false) {
-    const std::string key = "\"" + field + "\":";
-    const size_t key_pos = json.find(key);
-    if (key_pos == std::string::npos) {
-        return default_value;
-    }
-
-    size_t pos = key_pos + key.size();
-    while (pos < json.size() && json[pos] == ' ') {
-        ++pos;
-    }
-
-    if (json.compare(pos, 4, "true") == 0) {
-        return true;
-    }
-    if (json.compare(pos, 5, "false") == 0) {
-        return false;
-    }
-    return default_value;
 }
 
 std::string ToLower(std::string text) {
@@ -987,6 +1014,51 @@ bool RequestMockPlanner(const std::string& host, int port, const TurnContext& tu
     return true;
 }
 
+bool ReadBinaryFile(const std::string& path, std::vector<uint8_t>& out_bytes) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) {
+        return false;
+    }
+    out_bytes.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    return true;
+}
+
+SttResult RequestSttTranscription(const std::string& host,
+                                  const int port,
+                                  const std::vector<uint8_t>& wav_bytes,
+                                  const bool is_final) {
+    if (wav_bytes.empty()) {
+        return SttResult{false, "", is_final, "empty_audio"};
+    }
+
+    const std::string body = "{\"audio_base64\":\"" + Base64Encode(wav_bytes) +
+                             "\",\"audio_format\":\"wav\",\"is_final\":" + BoolJson(is_final) + "}";
+    const std::string request =
+        "POST /stt/transcribe HTTP/1.1\r\n"
+        "Host: " +
+        host + "\r\n"
+               "Content-Type: application/json\r\n"
+               "Connection: close\r\n"
+               "Content-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    std::string response;
+    if (!SendHttpRequest(host, port, request, response)) {
+        return SttResult{false, "", is_final, "sidecar_unreachable"};
+    }
+    const std::string response_body = ExtractHttpBody(response);
+    if (response.find("200 OK") == std::string::npos || response_body.empty()) {
+        const std::string error = ExtractJsonFieldString(response_body, "error");
+        return SttResult{false, "", is_final, error.empty() ? "stt_http_error" : error};
+    }
+    return SttResult{
+        true,
+        ExtractJsonFieldString(response_body, "text"),
+        ExtractJsonFieldBool(response_body, "is_final", is_final),
+        "",
+    };
+}
+
 std::string FormatDetectionsCompact(const std::vector<Detection>& detections) {
     if (detections.empty()) {
         return "[]";
@@ -1107,19 +1179,29 @@ class SpeechInputAdapter {
     virtual std::string Name() const = 0;
 };
 
-class MockTranscriptInputAdapter final : public SpeechInputAdapter {
+class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
    public:
+    SidecarSpeechInputAdapter(std::string host, const int port) : host_(std::move(host)), port_(port) {}
+
     bool TryConsumeConsoleLine(const std::string& line, TranscriptEvent& out_event) override {
-        const std::string partial_prefix = "say-partial ";
-        const std::string final_prefix = "say-final ";
-
-        if (line.rfind(partial_prefix, 0) == 0) {
-            out_event = TranscriptEvent{Trim(line.substr(partial_prefix.size())), false};
-            return true;
-        }
-
-        if (line.rfind(final_prefix, 0) == 0) {
-            out_event = TranscriptEvent{Trim(line.substr(final_prefix.size())), true};
+        const std::string prefix = "stt-file ";
+        if (line.rfind(prefix, 0) == 0) {
+            const std::string path = Trim(line.substr(prefix.size()));
+            if (path.empty()) {
+                Log("STT input ignored: missing wav path. Usage: stt-file <path_to_wav>");
+                return false;
+            }
+            std::vector<uint8_t> wav_bytes;
+            if (!ReadBinaryFile(path, wav_bytes)) {
+                Log("STT input failed: cannot open audio file '" + path + "'.");
+                return false;
+            }
+            const SttResult stt = RequestSttTranscription(host_, port_, wav_bytes, true);
+            if (!stt.ok) {
+                Log("STT sidecar failure: " + stt.error);
+                return false;
+            }
+            out_event = TranscriptEvent{stt.text, stt.is_final};
             return true;
         }
 
@@ -1127,8 +1209,12 @@ class MockTranscriptInputAdapter final : public SpeechInputAdapter {
     }
 
     std::string Name() const override {
-        return "mock-transcript-stdin";
+        return "python-sidecar-faster-whisper (stt-file <wav_path>)";
     }
+
+   private:
+    std::string host_;
+    int port_;
 };
 
 class CameraController {
@@ -1277,7 +1363,7 @@ int main() {
     }
 
     TtsController tts;
-    MockTranscriptInputAdapter speech_input;
+    SidecarSpeechInputAdapter speech_input("127.0.0.1", 8080);
     CameraController camera;
     bool debug_mode_enabled = false;
     const std::string debug_env = ToLower(Trim(EnvOrDefault("MIMOCA_DEBUG", "0")));
@@ -1290,8 +1376,8 @@ int main() {
     Log("Debug mode: " + std::string(debug_mode_enabled ? "enabled" : "disabled") +
         " (set MIMOCA_DEBUG=1 or use 'debug on').");
 
-    Log("Type 'current', 'next', 'camera', 'gesture <label> [confidence]', 'debug on|off|status', 'stop',");
-    Log("'say-partial <text>', 'say-final <text>', or 'exit'.");
+    Log("Type 'current', 'next', 'camera', 'gesture <label> [confidence]', 'stt-file <wav_path>',");
+    Log("'debug on|off|status', 'stop', or 'exit'.");
     std::string line;
     while (std::getline(std::cin, line)) {
         line = Trim(line);
@@ -1372,8 +1458,8 @@ int main() {
             Log("Mock gesture injected: label='" + turn_gesture.label + "', confidence=" +
                 std::to_string(turn_gesture.confidence));
         } else {
-            Log("Unknown command. Use: current | next | camera | gesture <label> [confidence] | debug on|off|status | stop | "
-                "say-partial <text> | say-final <text> | exit");
+            Log("Unknown command. Use: current | next | camera | gesture <label> [confidence] | stt-file <wav_path> | "
+                "debug on|off|status | stop | exit");
             continue;
         }
 
