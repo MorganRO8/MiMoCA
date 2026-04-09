@@ -136,6 +136,16 @@ struct SttResult {
     std::string error;
 };
 
+struct StreamingSttChunkResult {
+    bool ok = false;
+    bool speech_started = false;
+    bool speech_active = false;
+    bool is_final = false;
+    bool vad_available = true;
+    std::string text;
+    std::string error;
+};
+
 struct GestureCommand {
     bool parsed = false;
     Gesture gesture{"none", 0.0};
@@ -1059,6 +1069,160 @@ SttResult RequestSttTranscription(const std::string& host,
     };
 }
 
+bool ParseWavPcm16MonoOrStereo(const std::vector<uint8_t>& wav_bytes,
+                               int& out_sample_rate_hz,
+                               std::vector<uint8_t>& out_pcm_s16le) {
+    if (wav_bytes.size() < 44) {
+        return false;
+    }
+    auto read_u16 = [&wav_bytes](const size_t offset) -> uint16_t {
+        return static_cast<uint16_t>(wav_bytes[offset] | (static_cast<uint16_t>(wav_bytes[offset + 1]) << 8U));
+    };
+    auto read_u32 = [&wav_bytes](const size_t offset) -> uint32_t {
+        return static_cast<uint32_t>(wav_bytes[offset]) | (static_cast<uint32_t>(wav_bytes[offset + 1]) << 8U) |
+               (static_cast<uint32_t>(wav_bytes[offset + 2]) << 16U) | (static_cast<uint32_t>(wav_bytes[offset + 3]) << 24U);
+    };
+
+    if (std::string(reinterpret_cast<const char*>(&wav_bytes[0]), 4) != "RIFF" ||
+        std::string(reinterpret_cast<const char*>(&wav_bytes[8]), 4) != "WAVE") {
+        return false;
+    }
+
+    size_t cursor = 12;
+    uint16_t audio_format = 0;
+    uint16_t channels = 0;
+    uint16_t bits_per_sample = 0;
+    uint32_t sample_rate = 0;
+    size_t data_start = 0;
+    uint32_t data_size = 0;
+
+    while (cursor + 8 <= wav_bytes.size()) {
+        const std::string chunk_id(reinterpret_cast<const char*>(&wav_bytes[cursor]), 4);
+        const uint32_t chunk_size = read_u32(cursor + 4);
+        cursor += 8;
+        if (cursor + chunk_size > wav_bytes.size()) {
+            return false;
+        }
+        if (chunk_id == "fmt ") {
+            if (chunk_size < 16) {
+                return false;
+            }
+            audio_format = read_u16(cursor);
+            channels = read_u16(cursor + 2);
+            sample_rate = read_u32(cursor + 4);
+            bits_per_sample = read_u16(cursor + 14);
+        } else if (chunk_id == "data") {
+            data_start = cursor;
+            data_size = chunk_size;
+            break;
+        }
+        cursor += chunk_size + (chunk_size % 2);
+    }
+
+    if (audio_format != 1 || (channels != 1 && channels != 2) || bits_per_sample != 16 || data_start == 0 || data_size == 0) {
+        return false;
+    }
+
+    out_sample_rate_hz = static_cast<int>(sample_rate);
+    if (channels == 1) {
+        out_pcm_s16le.assign(wav_bytes.begin() + static_cast<long>(data_start),
+                             wav_bytes.begin() + static_cast<long>(data_start + data_size));
+        return true;
+    }
+
+    out_pcm_s16le.clear();
+    out_pcm_s16le.reserve(data_size / 2);
+    for (size_t i = data_start; i + 3 < data_start + data_size; i += 4) {
+        const int16_t left = static_cast<int16_t>(static_cast<uint16_t>(wav_bytes[i]) |
+                                                  (static_cast<uint16_t>(wav_bytes[i + 1]) << 8U));
+        const int16_t right = static_cast<int16_t>(static_cast<uint16_t>(wav_bytes[i + 2]) |
+                                                   (static_cast<uint16_t>(wav_bytes[i + 3]) << 8U));
+        const int16_t mono = static_cast<int16_t>((static_cast<int>(left) + static_cast<int>(right)) / 2);
+        out_pcm_s16le.push_back(static_cast<uint8_t>(mono & 0xFF));
+        out_pcm_s16le.push_back(static_cast<uint8_t>((mono >> 8) & 0xFF));
+    }
+    return !out_pcm_s16le.empty();
+}
+
+bool StartStreamingSttSession(const std::string& host, int port, int sample_rate_hz, std::string& session_id_out) {
+    const std::string body = "{\"sample_rate_hz\":" + std::to_string(sample_rate_hz) + "}";
+    const std::string request =
+        "POST /stt/session/start HTTP/1.1\r\n"
+        "Host: " +
+        host + "\r\n"
+               "Content-Type: application/json\r\n"
+               "Connection: close\r\n"
+               "Content-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    std::string response;
+    if (!SendHttpRequest(host, port, request, response)) {
+        return false;
+    }
+    const std::string response_body = ExtractHttpBody(response);
+    if (response.find("200 OK") == std::string::npos || response_body.empty()) {
+        return false;
+    }
+    session_id_out = ExtractJsonFieldString(response_body, "session_id");
+    return !session_id_out.empty();
+}
+
+StreamingSttChunkResult AppendStreamingSttChunk(const std::string& host,
+                                                int port,
+                                                const std::string& session_id,
+                                                const std::vector<uint8_t>& chunk) {
+    const std::string body = "{\"session_id\":\"" + EscapeJson(session_id) + "\",\"audio_chunk_base64\":\"" +
+                             Base64Encode(chunk) + "\"}";
+    const std::string request =
+        "POST /stt/session/chunk HTTP/1.1\r\n"
+        "Host: " +
+        host + "\r\n"
+               "Content-Type: application/json\r\n"
+               "Connection: close\r\n"
+               "Content-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    std::string response;
+    if (!SendHttpRequest(host, port, request, response)) {
+        return StreamingSttChunkResult{false, false, false, false, true, "", "sidecar_unreachable"};
+    }
+    const std::string response_body = ExtractHttpBody(response);
+    if (response.find("200 OK") == std::string::npos || response_body.empty()) {
+        return StreamingSttChunkResult{false, false, false, false, true, "", "stt_chunk_http_error"};
+    }
+    return StreamingSttChunkResult{
+        true,
+        ExtractJsonFieldBool(response_body, "speech_started", false),
+        ExtractJsonFieldBool(response_body, "speech_active", false),
+        ExtractJsonFieldBool(response_body, "is_final", false),
+        ExtractJsonFieldBool(response_body, "vad_available", true),
+        ExtractJsonFieldString(response_body, "text"),
+        "",
+    };
+}
+
+SttResult FinalizeStreamingSttSession(const std::string& host, int port, const std::string& session_id) {
+    const std::string body = "{\"session_id\":\"" + EscapeJson(session_id) + "\"}";
+    const std::string request =
+        "POST /stt/session/finalize HTTP/1.1\r\n"
+        "Host: " +
+        host + "\r\n"
+               "Content-Type: application/json\r\n"
+               "Connection: close\r\n"
+               "Content-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    std::string response;
+    if (!SendHttpRequest(host, port, request, response)) {
+        return SttResult{false, "", true, "sidecar_unreachable"};
+    }
+    const std::string response_body = ExtractHttpBody(response);
+    if (response.find("200 OK") == std::string::npos || response_body.empty()) {
+        return SttResult{false, "", true, "stt_finalize_http_error"};
+    }
+    return SttResult{true, ExtractJsonFieldString(response_body, "text"), true, ""};
+}
+
 std::string FormatDetectionsCompact(const std::vector<Detection>& detections) {
     if (detections.empty()) {
         return "[]";
@@ -1209,7 +1373,77 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
     }
 
     std::string Name() const override {
-        return "python-sidecar-faster-whisper (stt-file <wav_path>)";
+        return "python-sidecar-faster-whisper (stt-file <wav_path> | stt-stream-file <wav_path>)";
+    }
+
+    bool TryStreamWavWithVadInterruption(const std::string& line, TtsController& tts, TranscriptEvent& out_event) const {
+        const std::string prefix = "stt-stream-file ";
+        if (line.rfind(prefix, 0) != 0) {
+            return false;
+        }
+        const std::string path = Trim(line.substr(prefix.size()));
+        if (path.empty()) {
+            Log("STT stream input ignored: missing wav path. Usage: stt-stream-file <path_to_wav>");
+            return false;
+        }
+        std::vector<uint8_t> wav_bytes;
+        if (!ReadBinaryFile(path, wav_bytes)) {
+            Log("STT stream input failed: cannot open audio file '" + path + "'.");
+            return false;
+        }
+
+        int sample_rate_hz = 16000;
+        std::vector<uint8_t> pcm_s16le;
+        if (!ParseWavPcm16MonoOrStereo(wav_bytes, sample_rate_hz, pcm_s16le)) {
+            Log("STT stream input failed: only PCM16 WAV mono/stereo is supported.");
+            return false;
+        }
+
+        std::string session_id;
+        if (!StartStreamingSttSession(host_, port_, sample_rate_hz, session_id)) {
+            Log("STT stream failed: cannot start sidecar session.");
+            return false;
+        }
+
+        const size_t chunk_bytes = static_cast<size_t>(std::max(1, sample_rate_hz / 50) * 2);
+        bool interrupted = false;
+        std::string utterance_text;
+        for (size_t offset = 0; offset < pcm_s16le.size(); offset += chunk_bytes) {
+            const size_t remaining = pcm_s16le.size() - offset;
+            const size_t take = std::min(chunk_bytes, remaining);
+            std::vector<uint8_t> chunk(pcm_s16le.begin() + static_cast<long>(offset),
+                                       pcm_s16le.begin() + static_cast<long>(offset + take));
+            const StreamingSttChunkResult chunk_result = AppendStreamingSttChunk(host_, port_, session_id, chunk);
+            if (!chunk_result.ok) {
+                Log("STT stream chunk failed: " + chunk_result.error);
+                return false;
+            }
+            if (!chunk_result.vad_available && !interrupted) {
+                Log("VAD unavailable; falling back to manual interruption command ('stop').");
+            }
+            if (chunk_result.speech_started && !interrupted) {
+                Log("VAD detected speech start; interrupting TTS immediately.");
+                tts.Stop();
+                interrupted = true;
+            }
+            if (chunk_result.is_final && !chunk_result.text.empty()) {
+                if (!utterance_text.empty()) {
+                    utterance_text += " ";
+                }
+                utterance_text += chunk_result.text;
+            }
+        }
+
+        const SttResult final_result = FinalizeStreamingSttSession(host_, port_, session_id);
+        if (!final_result.ok) {
+            Log("STT stream finalize failed: " + final_result.error);
+            return false;
+        }
+        if (!final_result.text.empty()) {
+            utterance_text = final_result.text;
+        }
+        out_event = TranscriptEvent{utterance_text, true};
+        return true;
     }
 
    private:
@@ -1377,6 +1611,7 @@ int main() {
         " (set MIMOCA_DEBUG=1 or use 'debug on').");
 
     Log("Type 'current', 'next', 'camera', 'gesture <label> [confidence]', 'stt-file <wav_path>',");
+    Log("'stt-stream-file <wav_path>' (VAD + auto interrupt),");
     Log("'debug on|off|status', 'stop', or 'exit'.");
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -1429,7 +1664,8 @@ int main() {
         std::string command = line;
         Gesture turn_gesture{"none", 0.0};
         TranscriptEvent transcript_event{};
-        if (speech_input.TryConsumeConsoleLine(line, transcript_event)) {
+        if (speech_input.TryConsumeConsoleLine(line, transcript_event) ||
+            speech_input.TryStreamWavWithVadInterruption(line, tts, transcript_event)) {
             if (transcript_event.text.empty()) {
                 Log("Speech event ignored: empty transcript.");
                 continue;
@@ -1459,7 +1695,7 @@ int main() {
                 std::to_string(turn_gesture.confidence));
         } else {
             Log("Unknown command. Use: current | next | camera | gesture <label> [confidence] | stt-file <wav_path> | "
-                "debug on|off|status | stop | exit");
+                "stt-stream-file <wav_path> | debug on|off|status | stop | exit");
             continue;
         }
 
@@ -1547,7 +1783,7 @@ int main() {
 
     camera.Stop();
     tts.Stop();
-    Log("TTS gap: microphone-driven interruption is not wired yet; use 'stop' to cancel speech manually.");
+    Log("TTS interruption: VAD-driven interruption is available through streamed audio path; 'stop' remains manual fallback.");
     Log("Exiting MiMoCA prototype.");
     return 0;
 }
