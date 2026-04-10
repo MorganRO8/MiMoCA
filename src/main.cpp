@@ -3,6 +3,7 @@
 #include <ctime>
 #include <cstdlib>
 #include <cwchar>
+#include <cwctype>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -211,11 +212,6 @@ class TtsController {
 
             ApplyVoiceSelection(voice);
 
-            {
-                std::lock_guard<std::mutex> lock(voice_mutex_);
-                active_voice_ = voice;
-            }
-
             std::wstring wtext(text.begin(), text.end());
             voice->Speak(wtext.c_str(), SPF_ASYNC, nullptr);
 
@@ -231,15 +227,12 @@ class TtsController {
             }
 
             if (stop_requested_) {
+                voice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
                 Log("TTS stop requested; speech canceled.");
             } else {
                 Log("TTS finished.");
             }
 
-            {
-                std::lock_guard<std::mutex> lock(voice_mutex_);
-                active_voice_ = nullptr;
-            }
             voice->Release();
             if (should_uninitialize) {
                 CoUninitialize();
@@ -254,21 +247,46 @@ class TtsController {
 
         Log("TTS stop requested.");
         stop_requested_ = true;
-        {
-            std::lock_guard<std::mutex> lock(voice_mutex_);
-            if (active_voice_ != nullptr) {
-                active_voice_->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
-            }
-        }
         speech_thread_.join();
     }
 
    private:
-    static std::string ToLowerCopy(std::string text) {
-        std::transform(text.begin(), text.end(), text.begin(), [](const unsigned char c) {
-            return static_cast<char>(std::tolower(c));
+    static std::wstring ToLowerCopyWide(std::wstring text) {
+        std::transform(text.begin(), text.end(), text.begin(), [](const wchar_t c) {
+            return static_cast<wchar_t>(std::towlower(c));
         });
         return text;
+    }
+
+    static std::wstring Utf8ToWide(const std::string& utf8) {
+        if (utf8.empty()) {
+            return L"";
+        }
+        const int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.c_str(), -1, nullptr, 0);
+        if (chars <= 0) {
+            std::wstring fallback;
+            fallback.reserve(utf8.size());
+            for (const unsigned char c : utf8) {
+                fallback.push_back(static_cast<wchar_t>(c));
+            }
+            return fallback;
+        }
+        std::wstring wide(static_cast<size_t>(chars - 1), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.c_str(), -1, wide.data(), chars);
+        return wide;
+    }
+
+    static std::string WideToUtf8(const std::wstring& wide) {
+        if (wide.empty()) {
+            return "";
+        }
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (bytes <= 0) {
+            return "";
+        }
+        std::string utf8(static_cast<size_t>(bytes - 1), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, utf8.data(), bytes, nullptr, nullptr);
+        return utf8;
     }
 
     void ApplyVoiceSelection(ISpVoice* voice) const {
@@ -282,30 +300,30 @@ class TtsController {
             return;
         }
 
-        const std::string wanted = ToLowerCopy(selected_voice_);
+        const std::wstring wanted = ToLowerCopyWide(Utf8ToWide(selected_voice_));
         ISpObjectToken* matched_token = nullptr;
         ULONG fetched = 0;
         while (enum_tokens->Next(1, &matched_token, &fetched) == S_OK && matched_token != nullptr) {
             wchar_t* description = nullptr;
-            std::string description_text;
+            std::wstring description_text;
             if (SUCCEEDED(SpGetDescription(matched_token, &description)) && description != nullptr) {
                 description_text.assign(description, description + std::wcslen(description));
                 ::CoTaskMemFree(description);
             }
 
             wchar_t* token_id = nullptr;
-            std::string token_id_text;
+            std::wstring token_id_text;
             if (SUCCEEDED(matched_token->GetId(&token_id)) && token_id != nullptr) {
                 token_id_text.assign(token_id, token_id + std::wcslen(token_id));
                 ::CoTaskMemFree(token_id);
             }
 
-            const std::string haystack = ToLowerCopy(description_text + " " + token_id_text);
-            if (haystack.find(wanted) != std::string::npos) {
+            const std::wstring haystack = ToLowerCopyWide(description_text + L" " + token_id_text);
+            if (haystack.find(wanted) != std::wstring::npos) {
                 if (SUCCEEDED(voice->SetVoice(matched_token))) {
-                    Log("TTS voice selected: " + description_text);
+                    Log("TTS voice selected: " + WideToUtf8(description_text));
                 } else {
-                    Log("TTS voice selection failed for: " + description_text);
+                    Log("TTS voice selection failed for: " + WideToUtf8(description_text));
                 }
                 matched_token->Release();
                 enum_tokens->Release();
@@ -322,8 +340,6 @@ class TtsController {
     std::thread speech_thread_;
     std::atomic<bool> stop_requested_{false};
     std::string selected_voice_;
-    ISpVoice* active_voice_ = nullptr;
-    std::mutex voice_mutex_;
 };
 #else
 class TtsController {

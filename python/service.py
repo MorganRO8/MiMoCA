@@ -83,7 +83,8 @@ class FasterWhisperSpeechAdapter:
         self.model_name = DEFAULT_STT_MODEL
         self.device = DEFAULT_STT_DEVICE
         self.compute_type = DEFAULT_STT_COMPUTE_TYPE
-        self.model = self._load_model_with_fallback()
+        self.model: WhisperModel | None = None
+        self.load_failure: str = ""
         self.sessions: dict[str, BufferedAudioSession] = {}
         self.vad_frame_ms = int(os.getenv("MIMOCA_VAD_FRAME_MS", "20"))
         self.vad_start_frames = int(os.getenv("MIMOCA_VAD_START_FRAMES", "2"))
@@ -107,6 +108,17 @@ class FasterWhisperSpeechAdapter:
                 last_error = exc
                 logging.warning("STT model load failed for %s: %s", candidate, exc)
         raise RuntimeError(f"Failed to load any STT model candidate: {candidates}") from last_error
+
+    def _ensure_model_loaded(self) -> WhisperModel:
+        if self.model is not None:
+            return self.model
+        try:
+            self.model = self._load_model_with_fallback()
+            self.load_failure = ""
+            return self.model
+        except Exception as exc:  # noqa: BLE001
+            self.load_failure = str(exc)
+            raise RuntimeError("stt_unavailable") from exc
 
     @staticmethod
     def _decode_audio_bytes(audio_base64: str) -> bytes:
@@ -212,7 +224,8 @@ class FasterWhisperSpeechAdapter:
         audio = self._pcm_s16le_to_float32_mono(audio_bytes)
         if audio.size == 0:
             return {"text": "", "segments": []}
-        segments, info = self.model.transcribe(
+        model = self._ensure_model_loaded()
+        segments, info = model.transcribe(
             audio,
             language=language if language else None,
             vad_filter=True,
@@ -325,7 +338,7 @@ class FasterWhisperSpeechAdapter:
         session_id = str(payload.get("session_id", ""))
         if session_id not in self.sessions:
             raise ValueError("unknown_session_id")
-        buffered = self.sessions.pop(session_id)
+        buffered = self.sessions[session_id]
         language = payload.get("language")
         beam_size = int(payload.get("beam_size", 1))
         if buffered.utterance_audio_bytes:
@@ -341,6 +354,7 @@ class FasterWhisperSpeechAdapter:
             result["text"] = " ".join(buffered.utterance_texts).strip()
         result["session_id"] = session_id
         result["vad_available"] = buffered.vad_state.available if buffered.vad_state is not None else False
+        self.sessions.pop(session_id, None)
         return result
 
 
