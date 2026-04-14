@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(MiMoCA LANGUAGES CXX)
 
 include(GNUInstallDirs)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 add_executable(mimoca src/main.cpp)
 target_compile_features(mimoca PRIVATE cxx_std_20)
@@ -45,4 +46,26 @@ install(DIRECTORY scripts/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/scripts)
 
 if(MIMOCA_MANAGED_PYTHON_RUNTIME)
   install(DIRECTORY "${MIMOCA_MANAGED_PYTHON_RUNTIME}/" DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/runtime/python)
+endif()
+
+set(MIMOCA_READINESS_CHECKLIST "${CMAKE_SOURCE_DIR}/scripts/release_checklist.md" CACHE FILEPATH "Release readiness checklist path")
+set(MIMOCA_SMOKE_REPORT "${CMAKE_SOURCE_DIR}/artifacts/readiness/smoke_report.json" CACHE FILEPATH "Release smoke report path")
+set(MIMOCA_MANUAL_QA_REPORT "${CMAKE_SOURCE_DIR}/artifacts/readiness/manual_qa_report.json" CACHE FILEPATH "Release manual QA report path")
+
+add_custom_target(mimoca_release_smoke
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/smoke_release.py --repo ${CMAKE_SOURCE_DIR} --report ${MIMOCA_SMOKE_REPORT}
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Running MiMoCA release smoke checks")
+
+add_custom_target(mimoca_release_readiness
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/release_gate.py
+          --checklist ${MIMOCA_READINESS_CHECKLIST}
+          --smoke-report ${MIMOCA_SMOKE_REPORT}
+          --manual-report ${MIMOCA_MANUAL_QA_REPORT}
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Validating MiMoCA release readiness gate")
+add_dependencies(mimoca_release_readiness mimoca_release_smoke)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  add_dependencies(mimoca mimoca_release_readiness)
 endif()
