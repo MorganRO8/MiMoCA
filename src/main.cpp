@@ -52,7 +52,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#if defined(MIMOCA_HAS_WASAPI) && MIMOCA_HAS_WASAPI
 #include <Audioclient.h>
 #include <Mmdeviceapi.h>
 #endif
