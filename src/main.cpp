@@ -54,7 +54,6 @@
 #include <windows.h>
 #include <Audioclient.h>
 #include <Mmdeviceapi.h>
-#endif
 #include <wincred.h>
 #include <dpapi.h>
 #include <sapi.h>
