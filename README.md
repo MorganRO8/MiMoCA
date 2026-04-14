@@ -93,26 +93,72 @@ The C++ app now runs a tiny end-to-end path:
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
 The C++ app also logs camera lifecycle events (start/stop/first-frame availability).
 
-## Developer setup and run (non-required for end users)
+## Developer setup and run
 
-> These commands are for contributors and diagnostics. End users should use the installer + Start Menu launch path above.
+> End users should use the installer + Start Menu launch path. This section is for contributors and release engineering.
 
-### 1) Build C++ app
+### Installer-first build path (release pathway)
+
+1. **Install prerequisites (Windows):**
+   - Visual Studio 2022 with C++ desktop workload
+   - Windows 10/11 SDK
+   - CMake (3.26+ recommended)
+   - Python 3.11+
+2. **Configure + build the app in Release:**
+
+```powershell
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --config Release
+```
+
+3. **Stage install layout for packaging:**
+
+```powershell
+cmake --install build-release --config Release --prefix release
+```
+
+4. **Build the installer (`installer/mimoca.iss`):**
+
+```powershell
+$env:MIMOCA_VERSION = "0.1.0"
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer/mimoca.iss"
+```
+
+5. **Validate installer install/uninstall flow:**
+   - Install `MiMoCA-Setup-<version>.exe`
+   - Launch from Start Menu and confirm first-launch bootstrap succeeds
+   - Uninstall and verify local-data cleanup prompts/behavior (including model cache retention/removal choice)
+
+### Fast path for release testing
+
+```powershell
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --config Release
+cmake --install build-release --config Release --prefix release
+$env:MIMOCA_VERSION = "0.1.0"
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer/mimoca.iss"
+```
+
+### Manual/developer commands (non-release pathways)
+
+> These commands are intentionally **non-release pathways** for local development, debugging, and diagnostics.
+
+#### Build C++ app (developer iteration)
 
 ```bash
 cmake -S . -B build
 cmake --build build
 ```
 
-### 2) Bootstrap managed sidecar environment (automatic)
+#### Bootstrap managed sidecar environment (automatic, optional manual repair)
 
-On installer-first-run and normal first app run, MiMoCA now bootstraps a local sidecar virtual environment automatically:
+On installer-first-run and normal first app run, MiMoCA bootstraps a local sidecar virtual environment automatically:
 - creates `.mimoca_sidecar_venv`
 - installs `python/requirements.txt`
 - persists app defaults in `mimoca_app_config.json` (`sidecar_env_path`, `planner_mode`)
 - launches `python/service.py` with that exact venv interpreter
 
-You can also run the same bootstrap tool manually (for installer integration or repair flows):
+Optional manual bootstrap command:
 
 ```bash
 python3 python/bootstrap_sidecar_env.py \
@@ -120,7 +166,7 @@ python3 python/bootstrap_sidecar_env.py \
   --requirements python/requirements.txt
 ```
 
-### 3) Start Python sidecar manually (developer mode)
+#### Start Python sidecar manually (developer mode)
 
 From repo root:
 
@@ -130,7 +176,7 @@ python3 python/service.py
 
 The sidecar listens on `http://127.0.0.1:8080`.
 
-Startup now performs explicit modality initialization and readiness orchestration:
+Startup performs explicit modality initialization and readiness orchestration:
 - verifies/downloads Faster-Whisper model (`MIMOCA_STT_MODEL`)
 - verifies/downloads YOLO model (`MIMOCA_VISION_MODEL`)
 - verifies/downloads MediaPipe hand model (`MIMOCA_GESTURE_MODEL_PATH`, optionally fetched from `MIMOCA_GESTURE_MODEL_URL`)
@@ -165,7 +211,7 @@ Model cache paths are configurable:
 - `MIMOCA_REQUIRED_MODALITIES` (default `stt,vision`)
 - `MIMOCA_ALLOW_DEGRADED_STARTUP` (`true` by default)
 
-### 4) Run C++ app
+#### Run C++ app (manual, non-release pathway)
 
 ```bash
 ./build/mimoca
@@ -183,7 +229,7 @@ If planner mode is `llm` and no valid key is available at startup, the UI prompt
 
 ### Runtime configuration source
 
-MiMoCA now uses a single app-managed runtime profile file (default: `mimoca_app_config.json`, override path via `MIMOCA_APP_CONFIG_PATH`) for app + sidecar integration settings:
+MiMoCA uses a single app-managed runtime profile file (default: `mimoca_app_config.json`, override path via `MIMOCA_APP_CONFIG_PATH`) for app + sidecar integration settings:
 
 - `sidecar` (host, port, script path)
 - `modalities` (`speech_enabled`, `vision_enabled`, `gesture_enabled`, `tts_enabled`)
@@ -229,11 +275,11 @@ Defaults:
 If OpenCV is available at build time, camera capture is enabled automatically. If OpenCV is not found, the app stays in graceful camera-disabled mode and still runs speech + planner flow.
 Debug mode is disabled by default and can also be enabled at startup with `MIMOCA_DEBUG=1 ./build/mimoca`.
 
-## Developer diagnostics (manual endpoint checks, non-required)
+### Advanced diagnostics (manual sidecar/API endpoint checks, non-release pathway)
 
-> These checks are useful when developing/debugging the sidecar. End users do not need to run them.
+> These checks are optional developer diagnostics and are not required for installer-based release validation.
 
-### Health check
+#### Health check
 
 ```bash
 curl http://127.0.0.1:8080/health
@@ -242,6 +288,56 @@ curl http://127.0.0.1:8080/health
 Expected: JSON with `status: "ok"`.
 When startup initialization is still running, `/health` returns `503` with
 `status: "initializing"` and includes startup progress/status in `startup`.
+
+#### STT path (buffered WAV)
+
+```bash
+python3 - <<'PY'
+import base64, json, pathlib, urllib.request
+wav = pathlib.Path("sample.wav").read_bytes()
+payload = json.dumps({
+    "audio_base64": base64.b64encode(wav).decode("utf-8"),
+    "audio_format": "wav",
+    "is_final": True
+}).encode("utf-8")
+req = urllib.request.Request(
+    "http://127.0.0.1:8080/stt/transcribe",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+print(urllib.request.urlopen(req).read().decode("utf-8"))
+PY
+```
+
+Expected: JSON containing `text` and `is_final`.
+
+#### Planner path with recipe step context
+
+```bash
+curl -X POST http://127.0.0.1:8080/plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "timestamp": "2026-01-01T00:00:00Z",
+    "recipe_id": "demo_omelet",
+    "step_id": "step_1",
+    "branch_id": null,
+    "user_utterance": "what next?",
+    "current_step_instruction": "Crack two eggs into a bowl and whisk with a pinch of salt.",
+    "next_step_instruction": "Heat butter in a pan over medium heat and pour in the eggs.",
+    "gesture": {"label": "next", "confidence": 0.98},
+    "detections": [{"label": "knife", "confidence": 0.93, "bbox": [0.1, 0.2, 0.3, 0.4]}],
+    "hand_pose": {"label": "safe_claw", "confidence": 0.87},
+    "settings": {
+      "speech_enabled": true,
+      "vision_enabled": true,
+      "gesture_enabled": true,
+      "tts_enabled": true
+    }
+  }'
+```
+
+Expected: deterministic mock `PlannerResponse` JSON payload that can request step advancement.
 
 ## Release readiness workflow
 
