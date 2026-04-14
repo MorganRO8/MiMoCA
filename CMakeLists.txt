@@ -16,6 +16,9 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_executable(mimoca src/main.cpp)
 target_compile_features(mimoca PRIVATE cxx_std_20)
 
+link_directories("C:\\Program Files (x86)\\Windows Kits\\10\\Include")
+link_directories("C:\\Program Files (x86)\\Windows Kits\\10\\Lib")
+
 find_package(OpenCV QUIET COMPONENTS core videoio imgproc imgcodecs)
 if(OpenCV_FOUND)
   target_compile_definitions(mimoca PRIVATE MIMOCA_HAS_OPENCV=1)
