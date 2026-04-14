@@ -3756,7 +3756,7 @@ class MainWindow : public QMainWindow {
 
         planner_ready_ = planner_status.success;
         if (debug_mode_enabled_) {
-            debug_text_->setPlainText(DebugSnapshotText(debug_snapshot_));
+            debug_text_->setPlainText(QString::fromUtf8(DebugSnapshotText(debug_snapshot_).c_str()));
         }
         RefreshStatusIndicators();
     }
