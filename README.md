@@ -75,6 +75,9 @@ Startup now performs explicit modality initialization and readiness orchestratio
 - verifies/downloads MediaPipe hand model (`MIMOCA_GESTURE_MODEL_PATH`, optionally fetched from `MIMOCA_GESTURE_MODEL_URL`)
 - reports per-modality readiness via `/health` with statuses (`downloading`, `ready`, `failed`) and progress
 - blocks sidecar "ready" until required modalities are initialized, unless degraded mode is allowed
+- exposes planner runtime configuration endpoints:
+  - `POST /planner/validate_key` validates a candidate API key against the provider (`GET /models`)
+  - `POST /planner/configure` updates planner mode/key without restarting the sidecar
 
 Vision defaults:
 - `MIMOCA_VISION_MODEL=yolov8s-worldv2.pt`
@@ -112,6 +115,9 @@ On Windows builds with Qt6 available, startup opens the primary UI directly:
 - right-side transcript/chat history
 - status indicators for mic, gesture, planner, and sidecar health
 - developer-only debug toggle panel
+- planner settings button for API key update/revoke
+
+If planner mode is `llm` and no valid key is available at startup, the UI prompts for an OpenAI API key, validates it, and stores it in Windows Credential Manager + DPAPI (not plaintext config). Optional “skip for now (mock mode)” is shown only when `MIMOCA_ALLOW_PLANNER_SKIP_TO_MOCK=true`.
 
 Manual debug/console commands are no longer required for primary operation in that mode.
 On non-Qt builds, the executable prints a fallback message and exits.
