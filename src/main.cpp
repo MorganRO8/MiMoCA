@@ -270,11 +270,13 @@ class TtsController {
 
         Stop();
         stop_requested_ = false;
+        speaking_ = true;
         speech_thread_ = std::thread([this, text]() {
             Log("TTS start: " + text);
             const HRESULT init_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
             if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
                 Log("TTS unavailable: COM initialization failed.");
+                speaking_ = false;
                 return;
             }
             const bool should_uninitialize = SUCCEEDED(init_hr);
@@ -287,6 +289,7 @@ class TtsController {
                 if (should_uninitialize) {
                     CoUninitialize();
                 }
+                speaking_ = false;
                 return;
             }
 
@@ -317,6 +320,7 @@ class TtsController {
             if (should_uninitialize) {
                 CoUninitialize();
             }
+            speaking_ = false;
         });
     }
 
@@ -328,6 +332,10 @@ class TtsController {
         Log("TTS stop requested.");
         stop_requested_ = true;
         speech_thread_.join();
+    }
+
+    bool IsSpeaking() const {
+        return speaking_;
     }
 
    private:
@@ -419,6 +427,7 @@ class TtsController {
 
     std::thread speech_thread_;
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> speaking_{false};
     std::string selected_voice_;
 };
 #else
@@ -430,6 +439,7 @@ class TtsController {
         }
     }
     void Stop() {}
+    bool IsSpeaking() const { return false; }
 };
 #endif
 
@@ -2521,6 +2531,22 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
         session_id_.clear();
     }
 
+    bool ConsumeSpeechStartEvent() {
+        if (!pending_speech_start_event_) {
+            return false;
+        }
+        pending_speech_start_event_ = false;
+        return true;
+    }
+
+    bool speech_active() const {
+        return speech_active_;
+    }
+
+    bool vad_available() const {
+        return vad_available_;
+    }
+
     bool TryConsumeConsoleLine(const std::string& line, TranscriptEvent& out_event) override {
         const std::string prefix = "stt-file ";
         if (line.rfind(prefix, 0) == 0) {
@@ -2550,6 +2576,7 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
     }
 
     bool TryConsumeLiveMicrophoneFinalizedEvent(TtsController& tts, TranscriptEvent& out_event) override {
+        (void)tts;
         out_event = TranscriptEvent{};
         if (!StartConversation()) {
             return false;
@@ -2583,8 +2610,16 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
                 return false;
             }
             stt_error_logged_ = false;
+            vad_available_ = chunk_result.vad_available;
+            speech_active_ = chunk_result.speech_active;
             if (chunk_result.speech_started) {
-                tts.Stop();
+                const auto now = std::chrono::steady_clock::now();
+                if (!last_speech_start_at_.has_value() ||
+                    now - *last_speech_start_at_ >= std::chrono::milliseconds(kSpeechStartDebounceMs)) {
+                    pending_speech_start_event_ = true;
+                    last_speech_start_at_ = now;
+                    Log("VAD speech-start emitted from live mic stream.");
+                }
             }
             if ((chunk_result.speech_ended || chunk_result.is_final) && !chunk_result.text.empty()) {
                 saw_final = true;
@@ -2670,11 +2705,16 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
    private:
     std::string host_;
     int port_;
+    static constexpr int kSpeechStartDebounceMs = 220;
     mutable std::mutex queue_mutex_;
     std::deque<std::vector<uint8_t>> pending_pcm_chunks_;
     std::string session_id_;
     int sample_rate_hz_ = 16000;
     bool stt_error_logged_ = false;
+    bool pending_speech_start_event_ = false;
+    bool speech_active_ = false;
+    bool vad_available_ = true;
+    std::optional<std::chrono::steady_clock::time_point> last_speech_start_at_;
     WasapiMicCapture mic_capture_;
 };
 
@@ -3189,10 +3229,12 @@ class MainWindow : public QMainWindow {
         setCentralWidget(central);
 
         mic_status_ = new QLabel("mic: idle", this);
+        tts_status_ = new QLabel("tts: idle", this);
         gesture_status_ = new QLabel("gesture: idle", this);
         planner_status_ = new QLabel("planner: unknown", this);
         sidecar_status_ = new QLabel(sidecar_ok_ ? "sidecar: healthy" : "sidecar: unavailable", this);
         statusBar()->addPermanentWidget(mic_status_);
+        statusBar()->addPermanentWidget(tts_status_);
         statusBar()->addPermanentWidget(gesture_status_);
         statusBar()->addPermanentWidget(planner_status_);
         statusBar()->addPermanentWidget(sidecar_status_);
@@ -3210,6 +3252,14 @@ class MainWindow : public QMainWindow {
     void SubmitManualUtterance() {
         const std::string utterance = Trim(input_line_->text().toStdString());
         if (utterance.empty()) {
+            return;
+        }
+        const std::string normalized = ToLower(utterance);
+        if (normalized == "stop" || normalized == "stop speaking" || normalized == "quiet") {
+            tts_.Stop();
+            AppendChat("system", "Manual stop applied.");
+            RefreshStatusIndicators();
+            input_line_->clear();
             return;
         }
         input_line_->clear();
@@ -3245,10 +3295,13 @@ class MainWindow : public QMainWindow {
             intent.source = "speech_live_mic";
             AppendChat("user", transcript_event.text);
             ProcessTurn(intent);
-            mic_active_ = true;
-        } else {
-            mic_active_ = false;
         }
+        if (speech_input_.ConsumeSpeechStartEvent()) {
+            tts_.Stop();
+            last_speech_start_at_ = std::chrono::steady_clock::now();
+        }
+        mic_active_ = speech_input_.speech_active();
+        vad_available_ = speech_input_.vad_available();
 
         if (sidecar_ok_) {
             std::vector<uint8_t> latest_frame_jpeg;
@@ -3378,7 +3431,22 @@ class MainWindow : public QMainWindow {
     }
 
     void RefreshStatusIndicators() {
-        mic_status_->setText(std::string("mic: ").append(mic_active_ ? "active" : "idle").c_str());
+        const auto now = std::chrono::steady_clock::now();
+        const bool speech_started_recently =
+            last_speech_start_at_.has_value() &&
+            now - *last_speech_start_at_ < std::chrono::milliseconds(kSpeechStartIndicatorHoldMs);
+        std::string mic_label = "mic: ";
+        if (!sidecar_ok_) {
+            mic_label += "offline";
+        } else if (!vad_available_) {
+            mic_label += "listening (manual stop fallback)";
+        } else if (speech_started_recently) {
+            mic_label += "speech-start";
+        } else {
+            mic_label += mic_active_ ? "listening" : "idle";
+        }
+        mic_status_->setText(mic_label.c_str());
+        tts_status_->setText(std::string("tts: ").append(tts_.IsSpeaking() ? "speaking" : "idle").c_str());
         gesture_status_->setText(std::string("gesture: ").append(gesture_active_ ? "active" : "idle").c_str());
         std::string planner_label = "planner: ";
         if (!sidecar_ok_) {
@@ -3410,15 +3478,18 @@ class MainWindow : public QMainWindow {
     QCheckBox* dev_toggle_ = nullptr;
     QPlainTextEdit* debug_text_ = nullptr;
     QLabel* mic_status_ = nullptr;
+    QLabel* tts_status_ = nullptr;
     QLabel* gesture_status_ = nullptr;
     QLabel* planner_status_ = nullptr;
     QLabel* sidecar_status_ = nullptr;
 
     bool startup_failed_ = false;
+    static constexpr int kSpeechStartIndicatorHoldMs = 900;
     bool sidecar_ok_ = false;
     bool debug_mode_enabled_ = false;
     bool startup_prompt_pending_ = false;
     bool mic_active_ = false;
+    bool vad_available_ = true;
     bool gesture_active_ = false;
     bool planner_ready_ = false;
     bool planner_llm_configured_ = false;
@@ -3429,6 +3500,7 @@ class MainWindow : public QMainWindow {
     AppConfig app_config_{};
     std::string app_config_path_;
     DebugSnapshot debug_snapshot_{};
+    std::optional<std::chrono::steady_clock::time_point> last_speech_start_at_;
     TtsController tts_;
     SidecarSpeechInputAdapter speech_input_{"127.0.0.1", 8080};
     PythonSidecarManager sidecar_manager_{};
