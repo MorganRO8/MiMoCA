@@ -43,18 +43,28 @@ cmake -S . -B build
 cmake --build build
 ```
 
-### 2) Start Python sidecar
+### 2) Bootstrap managed sidecar environment (automatic)
+
+On installer-first-run and normal first app run, MiMoCA now bootstraps a local sidecar virtual environment automatically:
+- creates `.mimoca_sidecar_venv`
+- installs `python/requirements.txt`
+- persists the environment location in `mimoca_app_config.json` (`sidecar_env_path`)
+- launches `python/service.py` with that exact venv interpreter
+
+You can also run the same bootstrap tool manually (for installer integration or repair flows):
+
+```bash
+python3 python/bootstrap_sidecar_env.py \
+  --venv-path .mimoca_sidecar_venv \
+  --requirements python/requirements.txt
+```
+
+### 3) Start Python sidecar manually (developer mode)
 
 From repo root:
 
 ```bash
 python3 python/service.py
-```
-
-Install Python dependencies first:
-
-```bash
-python3 -m pip install -r python/requirements.txt
 ```
 
 The sidecar listens on `http://127.0.0.1:8080`.
@@ -76,7 +86,7 @@ Or override with:
 MIMOCA_GESTURE_MODEL_PATH=/full/path/to/hand_landmarker.task python3 python/service.py
 ```
 
-### 3) Run C++ app
+### 4) Run C++ app
 
 ```bash
 ./build/mimoca
@@ -196,6 +206,12 @@ Expected: deterministic mock `PlannerResponse` JSON payload that can request ste
 - If the YOLO model path points to an ONNX model, Ultralytics can run it with ONNX Runtime (`onnxruntime` dependency included).
 - The sidecar boundary is intentionally small and logged to keep iteration fast.
 - Recipe parsing is intentionally minimal and currently targets one startup recipe.
+
+## Installer notes (managed Python)
+
+- The installer should invoke `python/bootstrap_sidecar_env.py` during install or handoff to first-run bootstrap in the app.
+- If bootstrap fails, the app shows an actionable error with **Retry** so users can fix Python/network issues and continue.
+- The app always prefers `MIMOCA_PYTHON_EXECUTABLE` when explicitly set; otherwise it uses the persisted managed environment interpreter.
 
 ## Real LLM planner mode
 

@@ -2,9 +2,11 @@
 #include <chrono>
 #include <ctime>
 #include <cstdlib>
+#include <cstdio>
 #include <cwchar>
 #include <cwctype>
 #include <fstream>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <iterator>
@@ -27,6 +29,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QStatusBar>
@@ -216,7 +219,20 @@ struct RuntimeIntent {
     std::string source = "none";
 };
 
+struct AppConfig {
+    std::string sidecar_env_path;
+};
+
+struct SidecarBootstrapResult {
+    bool ok = false;
+    std::string venv_path;
+    std::string interpreter_path;
+    std::string error;
+    std::string raw_output;
+};
+
 void Log(const std::string& message);
+std::string ReadFileText(const std::string& path);
 
 #ifdef _WIN32
 class TtsController {
@@ -749,6 +765,132 @@ int EnvIntOrDefault(const char* name, const int fallback) {
         return fallback;
     }
     return static_cast<int>(parsed);
+}
+
+std::string DefaultAppConfigPath() {
+    return EnvOrDefault("MIMOCA_APP_CONFIG_PATH", "mimoca_app_config.json");
+}
+
+AppConfig LoadAppConfig(const std::string& path) {
+    AppConfig config{};
+    const std::string json = ReadFileText(path);
+    if (json.empty()) {
+        return config;
+    }
+    config.sidecar_env_path = Trim(ExtractJsonFieldString(json, "sidecar_env_path"));
+    return config;
+}
+
+bool SaveAppConfig(const std::string& path, const AppConfig& config) {
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) {
+        Log("Failed to write app config: " + path);
+        return false;
+    }
+    output << "{\n";
+    output << "  \"sidecar_env_path\": \"" << EscapeJson(config.sidecar_env_path) << "\"\n";
+    output << "}\n";
+    return true;
+}
+
+std::string QuoteForShell(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back('"');
+    for (const char c : value) {
+        if (c == '"') {
+            escaped += "\\\"";
+        } else {
+            escaped.push_back(c);
+        }
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
+bool RunCommandCapture(const std::string& command, int& exit_code, std::string& output) {
+    output.clear();
+#ifdef _WIN32
+    FILE* pipe = _popen((command + " 2>&1").c_str(), "r");
+#else
+    FILE* pipe = popen((command + " 2>&1").c_str(), "r");
+#endif
+    if (pipe == nullptr) {
+        exit_code = -1;
+        return false;
+    }
+
+    char buffer[512];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+#ifdef _WIN32
+    exit_code = _pclose(pipe);
+#else
+    exit_code = pclose(pipe);
+#endif
+    return true;
+}
+
+std::string TrimToJsonObject(const std::string& text) {
+    const size_t begin = text.find('{');
+    const size_t end = text.rfind('}');
+    if (begin == std::string::npos || end == std::string::npos || end < begin) {
+        return "";
+    }
+    return text.substr(begin, end - begin + 1);
+}
+
+std::string SidecarInterpreterFromVenv(const std::string& venv_path) {
+    const std::filesystem::path base(venv_path);
+#ifdef _WIN32
+    return (base / "Scripts" / "python.exe").string();
+#else
+    return (base / "bin" / "python3").string();
+#endif
+}
+
+SidecarBootstrapResult BootstrapManagedSidecarEnv(const std::string& bootstrap_python,
+                                                  const std::string& bootstrap_script,
+                                                  const std::string& venv_path,
+                                                  const std::string& requirements_path) {
+    SidecarBootstrapResult result{};
+    const std::string command = QuoteForShell(bootstrap_python) + " " + QuoteForShell(bootstrap_script) +
+                                " --venv-path " + QuoteForShell(venv_path) + " --requirements " +
+                                QuoteForShell(requirements_path);
+
+    int exit_code = -1;
+    std::string output;
+    if (!RunCommandCapture(command, exit_code, output)) {
+        result.error = "bootstrap_tool_unavailable";
+        return result;
+    }
+
+    result.raw_output = output;
+    const std::string json = TrimToJsonObject(output);
+    if (!json.empty()) {
+        result.ok = ExtractJsonFieldBool(json, "ok", false);
+        result.venv_path = ExtractJsonFieldString(json, "venv_path");
+        result.interpreter_path = ExtractJsonFieldString(json, "interpreter_path");
+        result.error = ExtractJsonFieldString(json, "error");
+    }
+
+    if (result.interpreter_path.empty() && !result.venv_path.empty()) {
+        result.interpreter_path = SidecarInterpreterFromVenv(result.venv_path);
+    }
+    if (result.venv_path.empty()) {
+        result.venv_path = venv_path;
+    }
+    if (exit_code != 0 && result.error.empty()) {
+        result.error = "bootstrap_exit_code_" + std::to_string(exit_code);
+    }
+    if (result.ok) {
+        Log("Managed sidecar environment ready at: " + result.venv_path);
+    } else {
+        Log("Managed sidecar environment failed: " + result.error);
+        Log("Bootstrap output: " + result.raw_output);
+    }
+    return result;
 }
 
 std::string SerializeTurnContext(const TurnContext& tc) {
@@ -2270,10 +2412,13 @@ class MainWindow : public QMainWindow {
 
    private:
     void InitializeSidecarWithProgress() {
+        app_config_path_ = DefaultAppConfigPath();
+        app_config_ = LoadAppConfig(app_config_path_);
+
         PythonSidecarManager::StartOptions options;
         options.host = EnvOrDefault("MIMOCA_SIDECAR_HOST", "127.0.0.1");
         options.port = EnvIntOrDefault("MIMOCA_SIDECAR_PORT", 8080);
-        options.python_path = EnvOrDefault("MIMOCA_PYTHON_EXECUTABLE", "python");
+        options.python_path = ResolveManagedSidecarInterpreter();
         options.script_path = EnvOrDefault("MIMOCA_SIDECAR_SCRIPT", "python/service.py");
         options.startup_retries = EnvIntOrDefault("MIMOCA_SIDECAR_HEALTH_RETRIES", 20);
         options.startup_retry_delay_ms = EnvIntOrDefault("MIMOCA_SIDECAR_HEALTH_RETRY_MS", 250);
@@ -2285,6 +2430,15 @@ class MainWindow : public QMainWindow {
             Log(message);
         };
 
+        if (options.python_path.empty()) {
+            sidecar_ok_ = false;
+            const std::string message =
+                "Could not prepare Python sidecar environment. Open Settings or installer repair and retry sidecar setup.";
+            AppendChat("system", message);
+            sidecar_status_->setText("sidecar: setup failed");
+            return;
+        }
+
         sidecar_ok_ = sidecar_manager_.EnsureReady(options, progress);
         if (sidecar_manager_.runtime_missing()) {
             AppendChat("system",
@@ -2292,6 +2446,70 @@ class MainWindow : public QMainWindow {
                        "MIMOCA_PYTHON_EXECUTABLE.");
         }
         statusBar()->clearMessage();
+    }
+
+    std::string ResolveManagedSidecarInterpreter() {
+        const std::string explicit_python = Trim(EnvOrDefault("MIMOCA_PYTHON_EXECUTABLE", ""));
+        if (!explicit_python.empty()) {
+            Log("Using explicit sidecar python from MIMOCA_PYTHON_EXECUTABLE.");
+            return explicit_python;
+        }
+
+        const std::string configured_env = Trim(app_config_.sidecar_env_path);
+        if (!configured_env.empty()) {
+            const std::string configured_interpreter = SidecarInterpreterFromVenv(configured_env);
+            if (std::filesystem::exists(std::filesystem::path(configured_interpreter))) {
+                Log("Using persisted managed sidecar environment: " + configured_env);
+                return configured_interpreter;
+            }
+            Log("Persisted sidecar environment missing, will bootstrap again: " + configured_env);
+        }
+
+        const std::filesystem::path default_env_path = std::filesystem::path(".mimoca_sidecar_venv");
+        const std::string bootstrap_python = EnvOrDefault("MIMOCA_BOOTSTRAP_PYTHON", "python");
+        const SidecarBootstrapResult bootstrap = BootstrapManagedSidecarEnv(
+            bootstrap_python, "python/bootstrap_sidecar_env.py", default_env_path.string(), "python/requirements.txt");
+
+        if (bootstrap.ok && !bootstrap.interpreter_path.empty()) {
+            app_config_.sidecar_env_path = bootstrap.venv_path;
+            SaveAppConfig(app_config_path_, app_config_);
+            return bootstrap.interpreter_path;
+        }
+
+        return ShowBootstrapFailureAndRetry(default_env_path.string(), bootstrap_python, bootstrap);
+    }
+
+    std::string ShowBootstrapFailureAndRetry(const std::string& default_env_path,
+                                             const std::string& bootstrap_python,
+                                             const SidecarBootstrapResult& first_result) {
+        SidecarBootstrapResult last_result = first_result;
+        while (true) {
+            QString detail = QString::fromStdString(
+                "Automatic sidecar setup failed.\n\n"
+                "What failed: " +
+                (last_result.error.empty() ? std::string("unknown error") : last_result.error) +
+                "\n\nActions:\n"
+                "1) Ensure Python 3.11+ is installed and on PATH.\n"
+                "2) Verify internet access for dependency download.\n"
+                "3) Use Retry after fixing the issue.");
+            if (!last_result.raw_output.empty()) {
+                detail += "\n\nInstaller output:\n" + QString::fromStdString(last_result.raw_output);
+            }
+
+            const auto button = QMessageBox::critical(
+                this, "Sidecar setup failed", detail, QMessageBox::Retry | QMessageBox::Cancel, QMessageBox::Retry);
+            if (button != QMessageBox::Retry) {
+                return "";
+            }
+
+            last_result = BootstrapManagedSidecarEnv(bootstrap_python, "python/bootstrap_sidecar_env.py",
+                                                     default_env_path, "python/requirements.txt");
+            if (last_result.ok && !last_result.interpreter_path.empty()) {
+                app_config_.sidecar_env_path = last_result.venv_path;
+                SaveAppConfig(app_config_path_, app_config_);
+                return last_result.interpreter_path;
+            }
+        }
     }
 
     void SetupUi() {
@@ -2546,6 +2764,8 @@ class MainWindow : public QMainWindow {
     bool planner_ready_ = false;
 
     RecipeState recipe_state_{};
+    AppConfig app_config_{};
+    std::string app_config_path_;
     DebugSnapshot debug_snapshot_{};
     TtsController tts_;
     SidecarSpeechInputAdapter speech_input_{"127.0.0.1", 8080};
