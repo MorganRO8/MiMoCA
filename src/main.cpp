@@ -221,6 +221,7 @@ enum class IntentType {
     kRepeatStep,
     kBranchOptionA,
     kBranchOptionB,
+    kPause,
     kExitDebug,
 };
 
@@ -725,6 +726,9 @@ IntentType IntentFromGestureLabel(const std::string& gesture_label) {
     if (gesture_label == "option_b") {
         return IntentType::kBranchOptionB;
     }
+    if (gesture_label == "pause") {
+        return IntentType::kPause;
+    }
     return IntentType::kNone;
 }
 
@@ -745,6 +749,8 @@ std::string FallbackCommandForIntent(const RuntimeIntent& intent) {
             return "option_a";
         case IntentType::kBranchOptionB:
             return "option_b";
+        case IntentType::kPause:
+            return "pause";
         case IntentType::kExitDebug:
             return "exit";
         case IntentType::kNone:
@@ -2237,7 +2243,8 @@ PlannerResponse LocalRecipeFallback(const RecipeState& state, const std::string&
 }
 
 bool IsSupportedGestureLabel(const std::string& label) {
-    return label == "next" || label == "repeat" || label == "option_a" || label == "option_b" || label == "none";
+    return label == "next" || label == "repeat" || label == "option_a" || label == "option_b" || label == "pause" ||
+           label == "none";
 }
 
 
@@ -3302,16 +3309,6 @@ class MainWindow : public QMainWindow {
         }
         mic_active_ = speech_input_.speech_active();
         vad_available_ = speech_input_.vad_available();
-
-        if (sidecar_ok_) {
-            std::vector<uint8_t> latest_frame_jpeg;
-            if (camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg)) {
-                Gesture detected_gesture{"none", 0.0};
-                if (RequestGestureDetection("127.0.0.1", 8080, latest_frame_jpeg, detected_gesture)) {
-                    gesture_active_ = detected_gesture.label != "none" && detected_gesture.confidence >= 0.6;
-                }
-            }
-        }
         const bool sidecar_previously_ok = sidecar_ok_;
         sidecar_ok_ = sidecar_manager_.PollAndRestartIfNeeded([this](const std::string& message) {
             statusBar()->showMessage(QString::fromStdString(message), 3000);
@@ -3332,7 +3329,83 @@ class MainWindow : public QMainWindow {
         if (!sidecar_ok_ && sidecar_manager_.runtime_missing()) {
             sidecar_status_->setText("sidecar: python runtime missing (see log)");
         }
+        MaybeProcessGestureIntent();
         RefreshStatusIndicators();
+    }
+
+    void MaybeProcessGestureIntent() {
+        const auto now = std::chrono::steady_clock::now();
+        if (!sidecar_ok_) {
+            gesture_status_text_ = "offline";
+            return;
+        }
+        if (last_gesture_sample_at_.has_value() &&
+            now - *last_gesture_sample_at_ < std::chrono::milliseconds(kGestureSampleIntervalMs)) {
+            return;
+        }
+        last_gesture_sample_at_ = now;
+
+        std::vector<uint8_t> latest_frame_jpeg;
+        if (!camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg)) {
+            gesture_status_text_ = "camera-unavailable";
+            gesture_active_ = false;
+            return;
+        }
+
+        Gesture detected_gesture{"none", 0.0};
+        if (!RequestGestureDetection("127.0.0.1", 8080, latest_frame_jpeg, detected_gesture)) {
+            gesture_status_text_ = "detect-error";
+            gesture_active_ = false;
+            return;
+        }
+        gesture_active_ = detected_gesture.label != "none" && detected_gesture.confidence >= kGestureMinConfidence;
+        gesture_status_text_ =
+            detected_gesture.label + " " + std::to_string(static_cast<int>(detected_gesture.confidence * 100.0)) + "%";
+
+        if (!IsSupportedGestureLabel(detected_gesture.label) || detected_gesture.label == "none" ||
+            detected_gesture.confidence < kGestureMinConfidence) {
+            dwell_label_.clear();
+            dwell_started_at_.reset();
+            return;
+        }
+
+        if (dwell_label_ != detected_gesture.label) {
+            dwell_label_ = detected_gesture.label;
+            dwell_started_at_ = now;
+            return;
+        }
+        if (!dwell_started_at_.has_value() ||
+            now - *dwell_started_at_ < std::chrono::milliseconds(kGestureDwellMs)) {
+            return;
+        }
+        if (now < gesture_cooldown_until_) {
+            gesture_status_text_ += " (cooldown)";
+            return;
+        }
+
+        RuntimeIntent intent{};
+        intent.type = IntentFromGestureLabel(detected_gesture.label);
+        intent.command = detected_gesture.label;
+        intent.gesture = detected_gesture;
+        intent.source = "gesture_auto";
+        HandleGestureIntent(intent);
+        gesture_cooldown_until_ = now + std::chrono::milliseconds(kGestureCooldownMs);
+        dwell_label_.clear();
+        dwell_started_at_.reset();
+    }
+
+    void HandleGestureIntent(const RuntimeIntent& intent) {
+        if (intent.type == IntentType::kNone) {
+            return;
+        }
+        const std::string recognized = intent.gesture.label.empty() ? intent.command : intent.gesture.label;
+        if (intent.type == IntentType::kPause) {
+            tts_.Stop();
+            AppendChat("system", "Gesture pause recognized. Speech paused.");
+            return;
+        }
+        AppendChat("user", "[gesture] " + recognized);
+        ProcessTurn(intent);
     }
 
     void UpdateCameraPreview() {
@@ -3447,7 +3520,11 @@ class MainWindow : public QMainWindow {
         }
         mic_status_->setText(mic_label.c_str());
         tts_status_->setText(std::string("tts: ").append(tts_.IsSpeaking() ? "speaking" : "idle").c_str());
-        gesture_status_->setText(std::string("gesture: ").append(gesture_active_ ? "active" : "idle").c_str());
+        std::string gesture_label = "gesture: " + gesture_status_text_;
+        if (gesture_active_) {
+            gesture_label += " (active)";
+        }
+        gesture_status_->setText(gesture_label.c_str());
         std::string planner_label = "planner: ";
         if (!sidecar_ok_) {
             planner_label += "offline fallback";
@@ -3491,6 +3568,15 @@ class MainWindow : public QMainWindow {
     bool mic_active_ = false;
     bool vad_available_ = true;
     bool gesture_active_ = false;
+    static constexpr int kGestureSampleIntervalMs = 220;
+    static constexpr int kGestureDwellMs = 420;
+    static constexpr int kGestureCooldownMs = 1500;
+    static constexpr double kGestureMinConfidence = 0.65;
+    std::string gesture_status_text_ = "idle";
+    std::optional<std::chrono::steady_clock::time_point> last_gesture_sample_at_;
+    std::optional<std::chrono::steady_clock::time_point> dwell_started_at_;
+    std::chrono::steady_clock::time_point gesture_cooldown_until_ = std::chrono::steady_clock::time_point::min();
+    std::string dwell_label_;
     bool planner_ready_ = false;
     bool planner_llm_configured_ = false;
     bool planner_fallback_active_ = false;
