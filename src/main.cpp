@@ -174,6 +174,25 @@ struct DebugSnapshot {
     PlannerRoundTripStatus planner;
 };
 
+enum class IntentType {
+    kNone,
+    kStartupReady,
+    kQueryCurrent,
+    kNextStep,
+    kRepeatStep,
+    kBranchOptionA,
+    kBranchOptionB,
+    kExitDebug,
+};
+
+struct RuntimeIntent {
+    IntentType type = IntentType::kNone;
+    std::string utterance;
+    std::string command;
+    Gesture gesture{"none", 0.0};
+    std::string source = "none";
+};
+
 void Log(const std::string& message);
 
 #ifdef _WIN32
@@ -604,6 +623,70 @@ std::string ToLower(std::string text) {
 
 bool ContainsText(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
+}
+
+IntentType IntentFromUtterance(const std::string& utterance) {
+    const std::string normalized = ToLower(utterance);
+    if (ContainsText(normalized, "exit")) {
+        return IntentType::kExitDebug;
+    }
+    if (ContainsText(normalized, "repeat")) {
+        return IntentType::kRepeatStep;
+    }
+    if (ContainsText(normalized, "current")) {
+        return IntentType::kQueryCurrent;
+    }
+    if (ContainsText(normalized, "next")) {
+        return IntentType::kNextStep;
+    }
+    if (ContainsText(normalized, "option a") || ContainsText(normalized, "left option")) {
+        return IntentType::kBranchOptionA;
+    }
+    if (ContainsText(normalized, "option b") || ContainsText(normalized, "right option")) {
+        return IntentType::kBranchOptionB;
+    }
+    return IntentType::kNone;
+}
+
+IntentType IntentFromGestureLabel(const std::string& gesture_label) {
+    if (gesture_label == "next") {
+        return IntentType::kNextStep;
+    }
+    if (gesture_label == "repeat") {
+        return IntentType::kRepeatStep;
+    }
+    if (gesture_label == "option_a") {
+        return IntentType::kBranchOptionA;
+    }
+    if (gesture_label == "option_b") {
+        return IntentType::kBranchOptionB;
+    }
+    return IntentType::kNone;
+}
+
+std::string FallbackCommandForIntent(const RuntimeIntent& intent) {
+    if (!intent.command.empty()) {
+        return intent.command;
+    }
+    switch (intent.type) {
+        case IntentType::kStartupReady:
+            return "ready";
+        case IntentType::kQueryCurrent:
+            return "current";
+        case IntentType::kNextStep:
+            return "next";
+        case IntentType::kRepeatStep:
+            return "repeat";
+        case IntentType::kBranchOptionA:
+            return "option_a";
+        case IntentType::kBranchOptionB:
+            return "option_b";
+        case IntentType::kExitDebug:
+            return "exit";
+        case IntentType::kNone:
+        default:
+            return "";
+    }
 }
 
 std::string EnvOrDefault(const char* name, const std::string& fallback) {
@@ -1576,6 +1659,7 @@ class SpeechInputAdapter {
    public:
     virtual ~SpeechInputAdapter() = default;
     virtual bool TryConsumeConsoleLine(const std::string& line, TranscriptEvent& out_event) = 0;
+    virtual bool TryConsumeLiveMicrophoneFinalizedEvent(TtsController& tts, TranscriptEvent& out_event) = 0;
     virtual std::string Name() const = 0;
 };
 
@@ -1609,7 +1693,56 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
     }
 
     std::string Name() const override {
-        return "python-sidecar-faster-whisper (stt-file <wav_path> | stt-stream-file <wav_path>)";
+        return "python-sidecar-faster-whisper (live mic polling + stt-file/stt-stream-file debug)";
+    }
+
+    bool TryConsumeLiveMicrophoneFinalizedEvent(TtsController& tts, TranscriptEvent& out_event) override {
+        if (!live_mic_supported_) {
+            return false;
+        }
+        const std::string endpoint = EnvOrDefault("MIMOCA_STT_LIVE_FINALIZED_ENDPOINT", "/stt/live/finalized");
+        const std::string body = "{}";
+        const std::string request =
+            "POST " + endpoint + " HTTP/1.1\r\n"
+            "Host: " + host_ +
+            "\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n"
+            "Content-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + body;
+
+        std::string response;
+        if (!SendHttpRequest(host_, port_, request, response)) {
+            if (!live_mic_warning_emitted_) {
+                Log("Live mic polling endpoint unavailable; continuing without speech-driven turns.");
+                live_mic_warning_emitted_ = true;
+            }
+            live_mic_supported_ = false;
+            return false;
+        }
+
+        const std::string response_body = ExtractHttpBody(response);
+        if (response.find("200 OK") == std::string::npos || response_body.empty()) {
+            if (!live_mic_warning_emitted_) {
+                Log("Live mic polling returned non-200; disabling live mic turns for this run.");
+                live_mic_warning_emitted_ = true;
+            }
+            live_mic_supported_ = false;
+            return false;
+        }
+
+        if (ExtractJsonFieldBool(response_body, "speech_started", false)) {
+            tts.Stop();
+        }
+        if (!ExtractJsonFieldBool(response_body, "is_final", false)) {
+            return false;
+        }
+        const std::string text = Trim(ExtractJsonFieldString(response_body, "text"));
+        if (text.empty()) {
+            return false;
+        }
+        out_event = TranscriptEvent{text, true};
+        return true;
     }
 
     bool TryStreamWavWithVadInterruption(const std::string& line, TtsController& tts, TranscriptEvent& out_event) const {
@@ -1685,6 +1818,28 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
    private:
     std::string host_;
     int port_;
+    bool live_mic_supported_ = true;
+    bool live_mic_warning_emitted_ = false;
+};
+
+class DebugConsoleInput {
+   public:
+    bool TryPopLine(std::string& out_line) {
+        if (std::cin.rdbuf()->in_avail() <= 0) {
+            return false;
+        }
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            return false;
+        }
+        out_line = Trim(line);
+        if (out_line.empty()) {
+            return false;
+        }
+        return true;
+    }
+
+    void Stop() {}
 };
 
 class CameraController {
@@ -1862,120 +2017,26 @@ int main() {
     Log("Debug mode: " + std::string(debug_mode_enabled ? "enabled" : "disabled") +
         " (set MIMOCA_DEBUG=1 or use 'debug on').");
 
-    Log("Type 'current', 'next', 'gesture', 'camera', 'stt-file <wav_path>',");
-    Log("'stt-stream-file <wav_path>' (VAD + auto interrupt),");
-    Log("'debug on|off|status', 'stop', or 'exit'.");
-    std::string line;
-    while (std::getline(std::cin, line)) {
-        line = Trim(line);
-        if (line.empty()) {
-            continue;
-        }
+    Log("Continuous runtime loop active (speech + vision + gestures).");
+    Log("Debug console fallback commands: debug on|off|status | camera | stop | stt-file <wav_path> | "
+        "stt-stream-file <wav_path> | exit");
 
-        if (line == "exit") {
-            break;
-        }
+    DebugConsoleInput debug_console;
+    bool running = true;
+    bool startup_prompt_pending = true;
+    bool gesture_unavailable_logged = false;
+    bool vision_unavailable_logged = false;
+    std::string last_triggered_gesture = "none";
+    auto last_gesture_trigger = std::chrono::steady_clock::now() - std::chrono::seconds(3);
 
-        if (line == "stop") {
-            tts.Stop();
-            continue;
-        }
-
-        if (line == "debug on") {
-            debug_mode_enabled = true;
-            Log("Debug mode enabled.");
-            continue;
-        }
-
-        if (line == "debug off") {
-            debug_mode_enabled = false;
-            Log("Debug mode disabled.");
-            continue;
-        }
-
-        if (line == "debug status") {
-            Log("Debug mode is " + std::string(debug_mode_enabled ? "enabled" : "disabled") + ".");
-            PrintDebugSnapshot(debug_snapshot);
-            continue;
-        }
-
-        if (line == "camera") {
-            const CameraSnapshot snapshot = camera.GetLatestSnapshot();
-            std::cout << "[MiMoCA] Camera status: " << snapshot.status_message << '\n';
-            std::cout << "  started: " << (snapshot.camera_started ? "true" : "false") << '\n';
-            std::cout << "  frame_available: " << (snapshot.frame_available ? "true" : "false") << '\n';
-            if (snapshot.frame_available) {
-                std::cout << "  latest_frame: " << snapshot.width << "x" << snapshot.height << '\n';
-                std::cout << "  captured_at: " << snapshot.capture_timestamp << '\n';
-                std::cout << "  frame_count: " << snapshot.frame_count << '\n';
-            }
-            continue;
-        }
-
-        std::string utterance;
-        std::string command = line;
-        Gesture turn_gesture{"none", 0.0};
-        std::vector<Detection> turn_detections;
-        TranscriptEvent transcript_event{};
-        if (speech_input.TryConsumeConsoleLine(line, transcript_event) ||
-            speech_input.TryStreamWavWithVadInterruption(line, tts, transcript_event)) {
-            if (transcript_event.text.empty()) {
-                Log("Speech event ignored: empty transcript.");
-                continue;
-            }
-
-            if (transcript_event.is_final) {
-                utterance = transcript_event.text;
-                command = utterance;
-                Log("Speech final transcript: '" + utterance + "'");
-                debug_snapshot.transcript = utterance;
-            } else {
-                Log("Speech partial transcript: '" + transcript_event.text + "'");
-                debug_snapshot.transcript = "(partial) " + transcript_event.text;
-                if (debug_mode_enabled) {
-                    PrintDebugSnapshot(debug_snapshot);
-                }
-                continue;
-            }
-        } else if (line == "current") {
-            utterance = "what is the current step?";
-        } else if (line == "next") {
-            utterance = "what next?";
-        } else if (line == "gesture") {
-            command = "gesture_detect";
-        } else {
-            Log("Unknown command. Use: current | next | gesture | camera | stt-file <wav_path> | "
-                "stt-stream-file <wav_path> | debug on|off|status | stop | exit");
-            continue;
-        }
-
-        if (!utterance.empty()) {
-            debug_snapshot.transcript = utterance;
-        }
-
+    auto process_turn = [&](const RuntimeIntent& intent, const std::vector<Detection>& detections,
+                            const CameraSnapshot& camera_snapshot) {
+        std::string utterance = intent.utterance;
+        Gesture turn_gesture = intent.gesture;
+        std::vector<Detection> turn_detections = detections;
         if (const std::string detected_branch = ResolveBranchSelection(recipe_state, utterance, turn_gesture);
             !detected_branch.empty()) {
             ApplyBranchSelection(recipe_state, detected_branch, turn_gesture.label == "none" ? "utterance" : "gesture");
-        }
-
-        const CameraSnapshot camera_snapshot = camera.GetLatestSnapshot();
-        if (sidecar_ok) {
-            std::vector<uint8_t> latest_frame_jpeg;
-            if (camera.TryEncodeLatestFrameJpeg(latest_frame_jpeg)) {
-                Gesture detected_gesture{"none", 0.0};
-                if (RequestGestureDetection("127.0.0.1", 8080, latest_frame_jpeg, detected_gesture)) {
-                    if (IsSupportedGestureLabel(detected_gesture.label)) {
-                        turn_gesture = detected_gesture;
-                    }
-                } else {
-                    Log("Gesture detection unavailable for this turn; continuing with gesture='none'.");
-                }
-                if (!RequestVisionDetections("127.0.0.1", 8080, latest_frame_jpeg, turn_detections)) {
-                    Log("Vision detection unavailable for this turn; continuing with detections=[].");
-                } else {
-                    Log("Vision detections for turn: " + FormatDetectionsCompact(turn_detections));
-                }
-            }
         }
 
         PlannerResponse response{};
@@ -1992,7 +2053,7 @@ int main() {
                 planner_status.success = false;
                 planner_status.used_fallback = true;
                 Log("Planner call failed; using local recipe fallback for this turn.");
-                response = LocalRecipeFallback(recipe_state, command);
+                response = LocalRecipeFallback(recipe_state, FallbackCommandForIntent(intent));
                 planner_status.source = "local_fallback_after_sidecar_error";
             } else {
                 const auto planner_end = std::chrono::steady_clock::now();
@@ -2001,7 +2062,7 @@ int main() {
                 planner_status.success = true;
             }
         } else {
-            response = LocalRecipeFallback(recipe_state, command);
+            response = LocalRecipeFallback(recipe_state, FallbackCommandForIntent(intent));
             planner_status.attempted = false;
             planner_status.success = true;
             planner_status.used_fallback = true;
@@ -2038,6 +2099,7 @@ int main() {
         }
 
         const RecipeStep* debug_current_step = GetCurrentStep(recipe_state);
+        debug_snapshot.transcript = utterance.empty() ? debug_snapshot.transcript : utterance;
         debug_snapshot.gesture = turn_gesture;
         debug_snapshot.detections = turn_context.detections;
         debug_snapshot.recipe_id = recipe_state.recipe.id;
@@ -2048,7 +2110,122 @@ int main() {
         if (debug_mode_enabled) {
             PrintDebugSnapshot(debug_snapshot);
         }
+    };
+
+    while (running) {
+        RuntimeIntent intent{};
+        const CameraSnapshot camera_snapshot = camera.GetLatestSnapshot();
+        std::vector<Detection> turn_detections;
+        std::vector<uint8_t> latest_frame_jpeg;
+        const bool has_jpeg = sidecar_ok && camera.TryEncodeLatestFrameJpeg(latest_frame_jpeg);
+
+        if (has_jpeg) {
+            if (!RequestVisionDetections("127.0.0.1", 8080, latest_frame_jpeg, turn_detections)) {
+                if (!vision_unavailable_logged) {
+                    Log("Vision detection unavailable; continuing with detections=[].");
+                    vision_unavailable_logged = true;
+                }
+            } else {
+                vision_unavailable_logged = false;
+            }
+        }
+
+        if (startup_prompt_pending) {
+            startup_prompt_pending = false;
+            intent.type = IntentType::kStartupReady;
+            intent.command = "ready";
+            intent.source = "internal";
+        } else {
+            TranscriptEvent transcript_event{};
+            if (sidecar_ok && speech_input.TryConsumeLiveMicrophoneFinalizedEvent(tts, transcript_event)) {
+                intent.type = IntentFromUtterance(transcript_event.text);
+                intent.utterance = transcript_event.text;
+                intent.command = transcript_event.text;
+                intent.source = "speech_live_mic";
+                debug_snapshot.transcript = transcript_event.text;
+                Log("Speech final transcript: '" + transcript_event.text + "'");
+            }
+        }
+
+        if (intent.type == IntentType::kNone && has_jpeg) {
+            Gesture detected_gesture{"none", 0.0};
+            if (RequestGestureDetection("127.0.0.1", 8080, latest_frame_jpeg, detected_gesture)) {
+                if (IsSupportedGestureLabel(detected_gesture.label)) {
+                    const auto now_tp = std::chrono::steady_clock::now();
+                    const bool cooldown_elapsed =
+                        (now_tp - last_gesture_trigger) >= std::chrono::milliseconds(1500);
+                    if (detected_gesture.label != "none" && detected_gesture.confidence >= 0.6 &&
+                        (detected_gesture.label != last_triggered_gesture || cooldown_elapsed)) {
+                        intent.type = IntentFromGestureLabel(detected_gesture.label);
+                        intent.gesture = detected_gesture;
+                        intent.command = detected_gesture.label;
+                        intent.source = "gesture";
+                        last_triggered_gesture = detected_gesture.label;
+                        last_gesture_trigger = now_tp;
+                    }
+                    debug_snapshot.gesture = detected_gesture;
+                }
+                gesture_unavailable_logged = false;
+            } else if (!gesture_unavailable_logged) {
+                Log("Gesture detection unavailable; continuing without gesture-triggered turns.");
+                gesture_unavailable_logged = true;
+            }
+        }
+
+        std::string debug_line;
+        if (debug_console.TryPopLine(debug_line)) {
+            if (debug_line == "exit") {
+                running = false;
+                continue;
+            }
+            if (debug_line == "stop") {
+                tts.Stop();
+            } else if (debug_line == "debug on") {
+                debug_mode_enabled = true;
+                Log("Debug mode enabled.");
+            } else if (debug_line == "debug off") {
+                debug_mode_enabled = false;
+                Log("Debug mode disabled.");
+            } else if (debug_line == "debug status") {
+                Log("Debug mode is " + std::string(debug_mode_enabled ? "enabled" : "disabled") + ".");
+                PrintDebugSnapshot(debug_snapshot);
+            } else if (debug_line == "camera") {
+                std::cout << "[MiMoCA] Camera status: " << camera_snapshot.status_message << '\n';
+                std::cout << "  started: " << (camera_snapshot.camera_started ? "true" : "false") << '\n';
+                std::cout << "  frame_available: " << (camera_snapshot.frame_available ? "true" : "false") << '\n';
+                if (camera_snapshot.frame_available) {
+                    std::cout << "  latest_frame: " << camera_snapshot.width << "x" << camera_snapshot.height << '\n';
+                    std::cout << "  captured_at: " << camera_snapshot.capture_timestamp << '\n';
+                    std::cout << "  frame_count: " << camera_snapshot.frame_count << '\n';
+                }
+            } else {
+                TranscriptEvent debug_transcript{};
+                if (speech_input.TryConsumeConsoleLine(debug_line, debug_transcript) ||
+                    speech_input.TryStreamWavWithVadInterruption(debug_line, tts, debug_transcript)) {
+                    if (!debug_transcript.text.empty()) {
+                        intent.type = IntentFromUtterance(debug_transcript.text);
+                        intent.utterance = debug_transcript.text;
+                        intent.command = debug_transcript.text;
+                        intent.source = "speech_debug_file";
+                    }
+                } else if (!debug_line.empty()) {
+                    Log("Debug command ignored: " + debug_line);
+                }
+            }
+        }
+
+        if (intent.type == IntentType::kExitDebug) {
+            running = false;
+            continue;
+        }
+        if (intent.type != IntentType::kNone) {
+            process_turn(intent, turn_detections, camera_snapshot);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
     }
+
+    debug_console.Stop();
 
     camera.Stop();
     tts.Stop();
