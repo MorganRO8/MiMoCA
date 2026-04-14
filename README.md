@@ -69,6 +69,13 @@ python3 python/service.py
 
 The sidecar listens on `http://127.0.0.1:8080`.
 
+Startup now performs explicit modality initialization and readiness orchestration:
+- verifies/downloads Faster-Whisper model (`MIMOCA_STT_MODEL`)
+- verifies/downloads YOLO model (`MIMOCA_VISION_MODEL`)
+- verifies/downloads MediaPipe hand model (`MIMOCA_GESTURE_MODEL_PATH`, optionally fetched from `MIMOCA_GESTURE_MODEL_URL`)
+- reports per-modality readiness via `/health` with statuses (`downloading`, `ready`, `failed`) and progress
+- blocks sidecar "ready" until required modalities are initialized, unless degraded mode is allowed
+
 Vision defaults:
 - `MIMOCA_VISION_MODEL=yolov8s-worldv2.pt`
 - `MIMOCA_VISION_CONFIDENCE=0.25`
@@ -85,6 +92,14 @@ Or override with:
 ```bash
 MIMOCA_GESTURE_MODEL_PATH=/full/path/to/hand_landmarker.task python3 python/service.py
 ```
+
+Model cache paths are configurable:
+- `MIMOCA_MODEL_CACHE_ROOT` (default `python/model_cache`)
+- `MIMOCA_STT_CACHE_ROOT`
+- `MIMOCA_VISION_CACHE_ROOT`
+- `MIMOCA_GESTURE_CACHE_ROOT`
+- `MIMOCA_REQUIRED_MODALITIES` (default `stt,vision`)
+- `MIMOCA_ALLOW_DEGRADED_STARTUP` (`true` by default)
 
 ### 4) Run C++ app
 
@@ -143,6 +158,8 @@ curl http://127.0.0.1:8080/health
 ```
 
 Expected: JSON with `status: "ok"`.
+When startup initialization is still running, `/health` returns `503` with
+`status: "initializing"` and includes startup progress/status in `startup`.
 
 ### STT path (buffered WAV)
 

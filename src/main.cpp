@@ -1057,7 +1057,16 @@ bool SendHttpRequest(const std::string& host, int port, const std::string& reque
     return !response_out.empty();
 }
 
-bool CheckPythonHealth(const std::string& host, int port) {
+struct SidecarHealthStatus {
+    bool reachable = false;
+    bool ready = false;
+    std::string summary;
+    double progress = 0.0;
+    std::string body;
+};
+
+SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
+    SidecarHealthStatus health{};
     const std::string request =
         "GET /health HTTP/1.1\r\n"
         "Host: " +
@@ -1066,18 +1075,23 @@ bool CheckPythonHealth(const std::string& host, int port) {
 
     std::string response;
     if (!SendHttpRequest(host, port, request, response)) {
-        return false;
+        return health;
     }
 
-    const bool ok = response.find("200 OK") != std::string::npos;
-    if (ok) {
+    const bool http_ok = response.find("200 OK") != std::string::npos;
+    const std::string body = ExtractHttpBody(response);
+    health.reachable = response.find("HTTP/1.1") != std::string::npos;
+    health.ready = http_ok && ExtractJsonFieldBool(body, "startup_ready", true);
+    health.summary = ExtractJsonFieldString(body, "startup_summary");
+    health.progress = ExtractJsonFieldDouble(body, "progress", 0.0);
+    health.body = body;
+    if (health.ready) {
         Log("Python sidecar health check succeeded.");
     } else {
-        Log("Python sidecar health check failed; unexpected response.");
+        Log("Python sidecar health check not ready yet.");
     }
-
     Log("Sidecar response preview: " + response.substr(0, std::min<size_t>(response.size(), 180)));
-    return ok;
+    return health;
 }
 
 class PythonSidecarManager {
@@ -1099,7 +1113,8 @@ class PythonSidecarManager {
         runtime_missing_message_.clear();
 
         progress_callback("Initializing speech/vision services…");
-        if (CheckPythonHealth(options.host, options.port)) {
+        const SidecarHealthStatus initial_health = QueryPythonHealth(options.host, options.port);
+        if (initial_health.ready) {
             ready_ = true;
             progress_callback("Speech/vision services ready.");
             return true;
@@ -1116,9 +1131,14 @@ class PythonSidecarManager {
         }
 
         for (int attempt = 1; attempt <= options.startup_retries; ++attempt) {
-            progress_callback("Initializing speech/vision services… (" + std::to_string(attempt) + "/" +
-                              std::to_string(options.startup_retries) + ")");
-            if (CheckPythonHealth(options.host, options.port)) {
+            SidecarHealthStatus health = QueryPythonHealth(options.host, options.port);
+            std::string message = "Initializing speech/vision services… (" + std::to_string(attempt) + "/" +
+                                  std::to_string(options.startup_retries) + ")";
+            if (!health.summary.empty()) {
+                message += " " + health.summary;
+            }
+            progress_callback(message);
+            if (health.ready) {
                 ready_ = true;
                 progress_callback("Speech/vision services ready.");
                 return true;
@@ -1137,11 +1157,11 @@ class PythonSidecarManager {
             return false;
         }
         if (IsManagedProcessAlive()) {
-            ready_ = CheckPythonHealth(options_.host, options_.port);
+            ready_ = QueryPythonHealth(options_.host, options_.port).ready;
             return ready_;
         }
         if (!is_spawned_) {
-            ready_ = CheckPythonHealth(options_.host, options_.port);
+            ready_ = QueryPythonHealth(options_.host, options_.port).ready;
             return ready_;
         }
 
