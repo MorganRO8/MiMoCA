@@ -10,6 +10,10 @@ if(OpenCV_FOUND)
   target_link_libraries(mimoca PRIVATE ${OpenCV_LIBS})
 endif()
 
+if(WIN32)
+  target_compile_definitions(mimoca PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
 if(MSVC)
   target_compile_options(mimoca PRIVATE /W4 /permissive-)
   target_link_libraries(mimoca PRIVATE sapi ole32)
