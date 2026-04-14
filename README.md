@@ -272,3 +272,112 @@ The `/health` payload reports planner state flags:
 - `planner_llm_configured`
 - `planner_llm_ready`
 - `planner_fallback_active`
+
+## Windows release packaging (installable build)
+
+The repository now includes a release workflow and installer project for Windows.
+
+### Release artifact layout
+
+The packaging job emits a deterministic `release/MiMoCA` tree before zipping/installer generation:
+
+```text
+release/MiMoCA/
+├─ bin/
+│  └─ mimoca.exe
+├─ python/
+│  ├─ service.py
+│  ├─ requirements.txt
+│  └─ bootstrap_sidecar_env.py
+├─ runtime/
+│  └─ python/                  # managed Python runtime copied from CI Python 3.11
+├─ .mimoca_sidecar_venv/       # managed venv created during packaging
+├─ assets/
+│  └─ recipes.json
+└─ scripts/
+   ├─ first_launch_setup.ps1   # idempotent first-run bootstrap
+   └─ launch_mimoca.bat        # Start Menu entry target
+```
+
+This satisfies the installable payload requirement of:
+- main executable
+- sidecar code
+- managed Python runtime + venv
+- required assets/bootstrap scripts
+
+Model files are intentionally not hardbundled and are downloaded by the sidecar on first run (or first install run) into `%LOCALAPPDATA%\MiMoCA\model_cache`.
+
+### Installer project (Inno Setup)
+
+Installer source: `installer/mimoca.iss`.
+
+Included behavior:
+- installs full payload under `Program Files\MiMoCA`
+- creates Start Menu entry (`MiMoCA`) and optional desktop shortcut
+- runs `scripts/first_launch_setup.ps1` automatically during install
+- optionally launches MiMoCA after install
+
+### First-launch dependency/model setup
+
+`launch_mimoca.bat` is the user-facing entrypoint used by the Start Menu shortcut. On every launch it:
+1. runs `scripts/first_launch_setup.ps1` (idempotent)
+2. ensures sidecar venv/config paths are present
+3. sets `MIMOCA_MODEL_CACHE_ROOT=%LOCALAPPDATA%\MiMoCA\model_cache`
+4. starts `bin\mimoca.exe`
+
+At application startup, the sidecar still performs modality initialization and model download/warmup automatically when needed.
+
+### Uninstall cleanup policy
+
+Uninstall now removes transient local data by default:
+- `%LOCALAPPDATA%\MiMoCA\logs`
+- `%LOCALAPPDATA%\MiMoCA\temp`
+- `%LOCALAPPDATA%\MiMoCA\app_data`
+- `%LOCALAPPDATA%\MiMoCA\sidecar_venv`
+
+During uninstall, the installer explicitly prompts whether to remove `%LOCALAPPDATA%\MiMoCA\model_cache`.
+- **Yes**: full cleanup including model cache
+- **No**: retains cached models for faster reinstall
+
+### Build and generate installer
+
+#### GitHub Actions (recommended)
+
+Run workflow: `.github/workflows/windows-release.yml`
+
+Triggers:
+- manual (`workflow_dispatch`) with `version`
+- tag push (`v*`)
+
+Produced artifacts:
+- `MiMoCA-<version>-windows-x64.zip`
+- `MiMoCA-Setup-<version>.exe`
+
+#### Local Windows build
+
+1. Build app:
+
+```powershell
+cmake -S . -B build -DMIMOCA_ENABLE_QT_UI=OFF
+cmake --build build --config Release
+```
+
+2. Create release layout (matching CI shape) and managed runtime/venv:
+
+```powershell
+$layout = "release/MiMoCA"
+New-Item -ItemType Directory -Force -Path "$layout/bin", "$layout/runtime/python" | Out-Null
+Copy-Item build/Release/mimoca.exe "$layout/bin/mimoca.exe" -Force
+Copy-Item python "$layout/python" -Recurse -Force
+Copy-Item assets "$layout/assets" -Recurse -Force
+Copy-Item scripts "$layout/scripts" -Recurse -Force
+Copy-Item "$env:pythonLocation/*" "$layout/runtime/python" -Recurse -Force
+& "$layout/runtime/python/python.exe" "$layout/python/bootstrap_sidecar_env.py" --venv-path "$layout/.mimoca_sidecar_venv" --requirements "$layout/python/requirements.txt"
+```
+
+3. Build installer:
+
+```powershell
+$env:MIMOCA_VERSION = "0.1.0"
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer/mimoca.iss"
+```

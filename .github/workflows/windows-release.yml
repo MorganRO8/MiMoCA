@@ -1,0 +1,93 @@
+name: windows-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (example: 0.1.0)"
+        required: true
+        default: "0.1.0"
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  package-windows:
+    runs-on: windows-latest
+    env:
+      BUILD_TYPE: Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DMIMOCA_ENABLE_QT_UI=OFF
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+
+      - name: Prepare release layout
+        shell: pwsh
+        run: |
+          $layoutRoot = Join-Path $PWD 'release/MiMoCA'
+          New-Item -ItemType Directory -Force -Path $layoutRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $layoutRoot 'bin') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $layoutRoot 'runtime/python') | Out-Null
+
+          Copy-Item 'build/Release/mimoca.exe' (Join-Path $layoutRoot 'bin/mimoca.exe') -Force
+          Copy-Item 'python' (Join-Path $layoutRoot 'python') -Recurse -Force
+          Copy-Item 'assets' (Join-Path $layoutRoot 'assets') -Recurse -Force
+          Copy-Item 'scripts' (Join-Path $layoutRoot 'scripts') -Recurse -Force
+          Copy-Item "$env:pythonLocation/*" (Join-Path $layoutRoot 'runtime/python') -Recurse -Force
+
+      - name: Generate managed venv in payload
+        shell: pwsh
+        run: |
+          $layoutRoot = Join-Path $PWD 'release/MiMoCA'
+          Push-Location $layoutRoot
+          try {
+            ./runtime/python/python.exe ./python/bootstrap_sidecar_env.py --venv-path .mimoca_sidecar_venv --requirements ./python/requirements.txt
+          } finally {
+            Pop-Location
+          }
+
+      - name: Build release zip
+        shell: pwsh
+        run: |
+          $version = '${{ github.event.inputs.version }}'
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = '${{ github.ref_name }}'.TrimStart('v')
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = '0.1.0'
+          }
+          Compress-Archive -Path release/MiMoCA/* -DestinationPath "release/MiMoCA-$version-windows-x64.zip" -Force
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = '${{ github.event.inputs.version }}'
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = '${{ github.ref_name }}'.TrimStart('v')
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = '0.1.0'
+          }
+          $env:MIMOCA_VERSION = $version
+          & "C:/Program Files (x86)/Inno Setup 6/ISCC.exe" "installer/mimoca.iss"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mimoca-windows-release
+          path: |
+            release/MiMoCA-*-windows-x64.zip
+            dist/MiMoCA-Setup-*.exe
