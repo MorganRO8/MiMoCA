@@ -4,6 +4,65 @@
 
 A **Windows-first multimodal cooking assistant prototype** built around a **C++ desktop app** with a **minimal Python sidecar**.
 
+## End-user Quickstart (Windows)
+
+Use this section if you just want to run MiMoCA successfully. You do **not** need curl checks or manual endpoint calls.
+
+### 1) Install
+
+- Preferred: install from the Windows installer (`MiMoCA-Setup-<version>.exe`).
+- The installer places the app in `Program Files\MiMoCA`, creates Start Menu shortcuts, and runs first-launch setup automatically.
+
+### 2) Launch
+
+- Open **Start Menu → MiMoCA** (or use the desktop shortcut if created).
+- The launcher runs `scripts/first_launch_setup.ps1` (idempotent), then starts the app.
+- On first run, MiMoCA may bootstrap the managed sidecar environment and download required models.
+
+### 3) Grant microphone + camera permissions
+
+When Windows prompts for permissions:
+- allow **Microphone** (voice input)
+- allow **Camera** (workspace awareness + gesture recognition)
+
+If camera is unavailable, MiMoCA should continue in voice-first mode.
+
+### 4) Optional API key prompt
+
+At startup, if planner mode is `llm` and no valid key is configured, the app prompts for an OpenAI-compatible API key.
+
+- Enter key → app validates it and stores it via Windows Credential Manager + DPAPI.
+- If enabled by `MIMOCA_ALLOW_PLANNER_SKIP_TO_MOCK=true`, you can skip and run in mock mode.
+
+### 5) Speak/gesture usage examples
+
+Try these spoken prompts:
+- “What do I do next?”
+- “Repeat that.”
+- “Can I use a pot instead of a rice cooker?”
+
+Supported gesture labels in the prototype:
+- `next`
+- `repeat`
+- `option_a`
+- `option_b`
+- `none`
+
+Branch selection example:
+- Say “rice cooker” or “pot”, or use `option_a` / `option_b` gesture where branch choices are offered.
+
+---
+
+## Troubleshooting (common failures)
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| Camera unavailable | Camera already in use, blocked permission, or missing OpenCV/device access | Close other camera apps, confirm Windows camera permission, then relaunch. MiMoCA should still run voice/planner flow without camera. |
+| API key missing / planner not ready | `llm` mode selected but key not set/invalid | Enter key in planner settings prompt, or run mock mode for now (`MIMOCA_PLANNER_MODE=mock`). |
+| Model download failure on first run | Network/proxy issue, blocked host, or interrupted bootstrap | Retry from app prompt, verify internet/proxy settings, and relaunch. Cached models live under `%LOCALAPPDATA%\MiMoCA\model_cache`. |
+
+---
+
 ## Current vertical slice
 
 This repo now includes:
@@ -34,7 +93,9 @@ The C++ app now runs a tiny end-to-end path:
 Both C++ and Python log serialized planner request/response JSON at the service boundary.
 The C++ app also logs camera lifecycle events (start/stop/first-frame availability).
 
-## Build and run (minimal)
+## Developer setup and run (non-required for end users)
+
+> These commands are for contributors and diagnostics. End users should use the installer + Start Menu launch path above.
 
 ### 1) Build C++ app
 
@@ -155,7 +216,9 @@ Defaults:
 If OpenCV is available at build time, camera capture is enabled automatically. If OpenCV is not found, the app stays in graceful camera-disabled mode and still runs speech + planner flow.
 Debug mode is disabled by default and can also be enabled at startup with `MIMOCA_DEBUG=1 ./build/mimoca`.
 
-## Manual health-path testing
+## Developer diagnostics (manual endpoint checks, non-required)
+
+> These checks are useful when developing/debugging the sidecar. End users do not need to run them.
 
 ### Health check
 
