@@ -812,6 +812,70 @@ class LlmPlannerAdapter:
             return False
         return bool(self.api_key) and bool(self.model) and self.provider == "openai_compatible"
 
+    def update_config(self, payload: dict) -> dict:
+        mode = str(payload.get("mode", self.mode)).strip().lower()
+        if mode not in {"mock", "llm"}:
+            raise ValueError("invalid_planner_mode")
+        provider = str(payload.get("provider", self.provider)).strip().lower()
+        if provider != "openai_compatible":
+            raise ValueError("unsupported_llm_provider")
+        base_url = str(payload.get("base_url", self.base_url)).strip().rstrip("/")
+        model = str(payload.get("model", self.model)).strip()
+        api_key = str(payload.get("api_key", self.api_key)).strip()
+
+        self.mode = mode
+        self.provider = provider
+        self.base_url = base_url or DEFAULT_LLM_BASE_URL.rstrip("/")
+        self.model = model or DEFAULT_LLM_MODEL
+        self.api_key = api_key
+        return {
+            "mode": self.mode,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model": self.model,
+            "llm_ready": self.llm_ready,
+        }
+
+    def _validate_openai_compatible_key(self, api_key: str, timeout_s: float = 6.0) -> dict:
+        if not api_key:
+            raise ValueError("llm_api_key_missing")
+        url = f"{self.base_url}/models"
+        req = urllib_request.Request(
+            url=url,
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=timeout_s) as resp:
+                body = resp.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"llm_http_error:{exc.code}:{detail[:220]}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"llm_request_failed:{exc}") from exc
+
+        parsed = json.loads(body) if body else {}
+        data = parsed.get("data", [])
+        return {
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model_count": len(data) if isinstance(data, list) else 0,
+        }
+
+    def validate_api_key(self, payload: dict) -> dict:
+        api_key = str(payload.get("api_key", "")).strip()
+        provider = str(payload.get("provider", self.provider)).strip().lower() or self.provider
+        if provider != "openai_compatible":
+            raise ValueError("unsupported_llm_provider")
+        meta = self._validate_openai_compatible_key(api_key)
+        return {
+            "ok": True,
+            "provider": provider,
+            "metadata": meta,
+        }
+
     @staticmethod
     def _compact_context(turn_context: dict) -> dict:
         detections = turn_context.get("detections", [])
@@ -1137,6 +1201,27 @@ class Handler(BaseHTTPRequestHandler):
                 logging.info("planner branch selection: %s", planner_response.get("new_branch_id"))
             logging.info("serialized PlannerResponse response: %s", json.dumps(planner_response, separators=(",", ":")))
             self._write_json(200, planner_response)
+            return
+
+        if self.path == "/planner/configure":
+            try:
+                updated = PLANNER_ADAPTER.update_config(payload)
+            except ValueError as exc:
+                self._write_json(400, {"error": str(exc)})
+                return
+            self._write_json(200, {"ok": True, "planner": updated})
+            return
+
+        if self.path == "/planner/validate_key":
+            try:
+                result = PLANNER_ADAPTER.validate_api_key(payload)
+            except ValueError as exc:
+                self._write_json(400, {"error": str(exc)})
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._write_json(400, {"ok": False, "error": str(exc)})
+                return
+            self._write_json(200, result)
             return
 
         try:

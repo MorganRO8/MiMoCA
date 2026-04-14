@@ -25,6 +25,8 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QDateTime>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -48,9 +50,13 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <wincred.h>
+#include <dpapi.h>
 #include <sapi.h>
 #include <sphelper.h>
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Crypt32.lib")
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -233,6 +239,7 @@ struct SidecarBootstrapResult {
 
 void Log(const std::string& message);
 std::string ReadFileText(const std::string& path);
+bool SendHttpRequest(const std::string& host, int port, const std::string& request, std::string& response_out);
 
 #ifdef _WIN32
 class TtsController {
@@ -953,6 +960,112 @@ std::string ExtractHttpBody(const std::string& response) {
     return response.substr(pos + header_delim.size());
 }
 
+int ParseHttpStatusCode(const std::string& response) {
+    const size_t first_space = response.find(' ');
+    if (first_space == std::string::npos) {
+        return 0;
+    }
+    const size_t second_space = response.find(' ', first_space + 1);
+    const std::string token = response.substr(first_space + 1, second_space - first_space - 1);
+    try {
+        return std::stoi(token);
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+bool SendJsonPost(const std::string& host,
+                  int port,
+                  const std::string& path,
+                  const std::string& body,
+                  int& status_code_out,
+                  std::string& response_body_out) {
+    const std::string request =
+        "POST " + path + " HTTP/1.1\r\n"
+        "Host: " +
+        host + "\r\n"
+               "Content-Type: application/json\r\n"
+               "Connection: close\r\n"
+               "Content-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+    std::string response;
+    if (!SendHttpRequest(host, port, request, response)) {
+        status_code_out = 0;
+        response_body_out.clear();
+        return false;
+    }
+    status_code_out = ParseHttpStatusCode(response);
+    response_body_out = ExtractHttpBody(response);
+    return true;
+}
+
+#ifdef _WIN32
+constexpr wchar_t kPlannerApiKeyCredentialTarget[] = L"MiMoCA.OpenAIApiKey";
+
+bool SavePlannerApiKeySecure(const std::string& api_key) {
+    if (api_key.empty()) {
+        return false;
+    }
+    DATA_BLOB in_blob{};
+    in_blob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(api_key.data()));
+    in_blob.cbData = static_cast<DWORD>(api_key.size());
+    DATA_BLOB out_blob{};
+    if (!CryptProtectData(&in_blob, L"MiMoCA planner API key", nullptr, nullptr, nullptr, 0, &out_blob)) {
+        return false;
+    }
+
+    CREDENTIALW credential{};
+    credential.Type = CRED_TYPE_GENERIC;
+    credential.TargetName = const_cast<LPWSTR>(kPlannerApiKeyCredentialTarget);
+    credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
+    credential.CredentialBlobSize = out_blob.cbData;
+    credential.CredentialBlob = out_blob.pbData;
+    credential.UserName = const_cast<LPWSTR>(L"mimoca");
+    const bool ok = CredWriteW(&credential, 0) != FALSE;
+    LocalFree(out_blob.pbData);
+    return ok;
+}
+
+bool LoadPlannerApiKeySecure(std::string& api_key_out) {
+    api_key_out.clear();
+    PCREDENTIALW credential = nullptr;
+    if (!CredReadW(kPlannerApiKeyCredentialTarget, CRED_TYPE_GENERIC, 0, &credential)) {
+        return false;
+    }
+    DATA_BLOB in_blob{};
+    in_blob.pbData = credential->CredentialBlob;
+    in_blob.cbData = credential->CredentialBlobSize;
+    DATA_BLOB out_blob{};
+    const bool decrypted = CryptUnprotectData(&in_blob, nullptr, nullptr, nullptr, nullptr, 0, &out_blob) != FALSE;
+    if (decrypted && out_blob.pbData != nullptr && out_blob.cbData > 0) {
+        api_key_out.assign(reinterpret_cast<const char*>(out_blob.pbData), out_blob.cbData);
+    }
+    if (out_blob.pbData != nullptr) {
+        LocalFree(out_blob.pbData);
+    }
+    CredFree(credential);
+    return decrypted && !api_key_out.empty();
+}
+
+bool DeletePlannerApiKeySecure() {
+    const BOOL deleted = CredDeleteW(kPlannerApiKeyCredentialTarget, CRED_TYPE_GENERIC, 0);
+    if (deleted != FALSE) {
+        return true;
+    }
+    return GetLastError() == ERROR_NOT_FOUND;
+}
+#else
+bool SavePlannerApiKeySecure(const std::string& api_key) {
+    (void)api_key;
+    return false;
+}
+bool LoadPlannerApiKeySecure(std::string& api_key_out) {
+    api_key_out.clear();
+    return false;
+}
+bool DeletePlannerApiKeySecure() { return false; }
+#endif
+
 PlannerResponse ParsePlannerResponseBody(const std::string& body) {
     PlannerResponse response{};
     response.assistant_text = ExtractJsonFieldString(body, "assistant_text");
@@ -1063,6 +1176,8 @@ struct SidecarHealthStatus {
     std::string summary;
     double progress = 0.0;
     std::string body;
+    std::string planner_mode = "mock";
+    bool planner_llm_ready = false;
 };
 
 SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
@@ -1085,6 +1200,11 @@ SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
     health.summary = ExtractJsonFieldString(body, "startup_summary");
     health.progress = ExtractJsonFieldDouble(body, "progress", 0.0);
     health.body = body;
+    health.planner_mode = Trim(ExtractJsonFieldString(body, "planner_mode"));
+    if (health.planner_mode.empty()) {
+        health.planner_mode = "mock";
+    }
+    health.planner_llm_ready = ExtractJsonFieldBool(body, "planner_llm_ready", false);
     if (health.ready) {
         Log("Python sidecar health check succeeded.");
     } else {
@@ -1630,6 +1750,47 @@ bool RequestMockPlanner(const std::string& host, int port, const TurnContext& tu
     }
 
     out = ParsePlannerResponseBody(response_body);
+    return true;
+}
+
+bool RequestPlannerConfigure(const std::string& host,
+                             int port,
+                             const std::string& mode,
+                             const std::string& api_key,
+                             std::string& error_out) {
+    const std::string body = "{\"mode\":\"" + EscapeJson(mode) + "\",\"api_key\":\"" + EscapeJson(api_key) + "\"}";
+    int status_code = 0;
+    std::string response_body;
+    if (!SendJsonPost(host, port, "/planner/configure", body, status_code, response_body)) {
+        error_out = "sidecar_unreachable";
+        return false;
+    }
+    if (status_code != 200) {
+        error_out = ExtractJsonFieldString(response_body, "error");
+        if (error_out.empty()) {
+            error_out = "planner_configure_failed";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool RequestPlannerValidateKey(const std::string& host, int port, const std::string& api_key, std::string& error_out) {
+    const std::string body = "{\"api_key\":\"" + EscapeJson(api_key) + "\"}";
+    int status_code = 0;
+    std::string response_body;
+    if (!SendJsonPost(host, port, "/planner/validate_key", body, status_code, response_body)) {
+        error_out = "sidecar_unreachable";
+        return false;
+    }
+    const bool ok = ExtractJsonFieldBool(response_body, "ok", status_code == 200);
+    if (status_code != 200 || !ok) {
+        error_out = ExtractJsonFieldString(response_body, "error");
+        if (error_out.empty()) {
+            error_out = "api_key_validation_failed";
+        }
+        return false;
+    }
     return true;
 }
 
@@ -2413,6 +2574,7 @@ class MainWindow : public QMainWindow {
 
         SetupUi();
         InitializeSidecarWithProgress();
+        EnsurePlannerApiKeyAtStartup();
         camera_.Start(0);
         RefreshStatusIndicators();
 
@@ -2532,6 +2694,146 @@ class MainWindow : public QMainWindow {
         }
     }
 
+    bool ProductPolicyAllowsMockSkip() const {
+        const std::string raw = ToLower(Trim(EnvOrDefault("MIMOCA_ALLOW_PLANNER_SKIP_TO_MOCK", "false")));
+        return raw == "1" || raw == "true" || raw == "yes" || raw == "on";
+    }
+
+    bool ConfigurePlannerLlmWithKey(const std::string& api_key, std::string& error_out) {
+        if (!sidecar_ok_) {
+            error_out = "sidecar_unavailable";
+            return false;
+        }
+        if (!RequestPlannerValidateKey("127.0.0.1", 8080, api_key, error_out)) {
+            return false;
+        }
+        if (!SavePlannerApiKeySecure(api_key)) {
+            error_out = "secure_store_write_failed";
+            return false;
+        }
+        if (!RequestPlannerConfigure("127.0.0.1", 8080, "llm", api_key, error_out)) {
+            return false;
+        }
+        sidecar_status_->setText("sidecar: planner llm configured");
+        return true;
+    }
+
+    void EnsurePlannerApiKeyAtStartup() {
+        if (!sidecar_ok_) {
+            return;
+        }
+        const SidecarHealthStatus health = QueryPythonHealth("127.0.0.1", 8080);
+        if (health.planner_mode != "llm" || health.planner_llm_ready) {
+            return;
+        }
+
+        std::string stored_key;
+        if (LoadPlannerApiKeySecure(stored_key)) {
+            std::string configure_error;
+            if (ConfigurePlannerLlmWithKey(stored_key, configure_error)) {
+                AppendChat("system", "Planner API key loaded securely. LLM mode enabled.");
+                return;
+            }
+            Log("Stored planner API key could not be used: " + configure_error);
+        }
+        ShowPlannerSettingsDialog(true);
+    }
+
+    void RevokePlannerKey() {
+        const bool deleted = DeletePlannerApiKeySecure();
+        std::string error;
+        if (sidecar_ok_) {
+            RequestPlannerConfigure("127.0.0.1", 8080, "mock", "", error);
+        }
+        if (!deleted) {
+            QMessageBox::warning(this, "Planner key revoke", "Could not remove stored API key from secure storage.");
+            return;
+        }
+        AppendChat("system", "Planner key revoked. Running in mock planner mode.");
+    }
+
+    void ShowPlannerSettingsDialog(bool startup_required) {
+        const bool allow_skip_to_mock = ProductPolicyAllowsMockSkip();
+        while (true) {
+            QDialog dialog(this);
+            dialog.setWindowTitle(startup_required ? "Planner setup required" : "Planner settings");
+            auto* layout = new QVBoxLayout(&dialog);
+            auto* info = new QLabel(
+                startup_required
+                    ? "Planner mode is set to LLM and no valid API key is configured.\nEnter an OpenAI API key to continue."
+                    : "Enter an OpenAI API key to update planner credentials.",
+                &dialog);
+            info->setWordWrap(true);
+            layout->addWidget(info);
+
+            auto* key_input = new QLineEdit(&dialog);
+            key_input->setPlaceholderText("sk-...");
+            key_input->setEchoMode(QLineEdit::Password);
+            layout->addWidget(key_input);
+
+            auto* button_row = new QHBoxLayout();
+            auto* save_btn = new QPushButton("Validate + Save", &dialog);
+            auto* revoke_btn = new QPushButton("Revoke key", &dialog);
+            auto* cancel_btn = new QPushButton(startup_required ? "Cancel" : "Close", &dialog);
+            button_row->addWidget(save_btn);
+            button_row->addWidget(revoke_btn);
+            if (startup_required && allow_skip_to_mock) {
+                auto* skip_btn = new QPushButton("Skip for now (mock mode)", &dialog);
+                button_row->addWidget(skip_btn);
+                connect(skip_btn, &QPushButton::clicked, &dialog, [&dialog]() { dialog.done(2); });
+            }
+            button_row->addWidget(cancel_btn);
+            layout->addLayout(button_row);
+
+            connect(save_btn, &QPushButton::clicked, &dialog, [&dialog]() { dialog.accept(); });
+            connect(revoke_btn, &QPushButton::clicked, &dialog, [&dialog]() { dialog.done(3); });
+            connect(cancel_btn, &QPushButton::clicked, &dialog, [&dialog]() { dialog.reject(); });
+
+            const int result = dialog.exec();
+            if (result == QDialog::Accepted) {
+                const std::string api_key = Trim(key_input->text().toStdString());
+                if (api_key.empty()) {
+                    QMessageBox::warning(this, "Planner key required", "API key cannot be empty.");
+                    continue;
+                }
+                std::string configure_error;
+                if (!ConfigurePlannerLlmWithKey(api_key, configure_error)) {
+                    QMessageBox::warning(this, "Planner key invalid",
+                                         QString::fromStdString("Could not validate/save API key: " + configure_error));
+                    continue;
+                }
+                AppendChat("system", "Planner API key updated. LLM mode is active.");
+                return;
+            }
+            if (result == 3) {
+                RevokePlannerKey();
+                if (startup_required && !allow_skip_to_mock) {
+                    continue;
+                }
+                return;
+            }
+            if (result == 2 && startup_required && allow_skip_to_mock) {
+                std::string configure_error;
+                if (!RequestPlannerConfigure("127.0.0.1", 8080, "mock", "", configure_error)) {
+                    QMessageBox::warning(this, "Planner fallback failed",
+                                         QString::fromStdString("Could not switch planner to mock mode: " + configure_error));
+                    continue;
+                }
+                AppendChat("system", "Planner key setup skipped by policy. Running mock mode.");
+                return;
+            }
+            if (!startup_required) {
+                return;
+            }
+            if (!allow_skip_to_mock) {
+                QMessageBox::warning(this, "Planner setup required",
+                                     "A valid API key is required by product policy for current planner mode.");
+                continue;
+            }
+            return;
+        }
+    }
+
     void SetupUi() {
         auto* central = new QWidget(this);
         auto* root = new QHBoxLayout(central);
@@ -2561,6 +2863,9 @@ class MainWindow : public QMainWindow {
         input_row->addWidget(input_line_, 1);
         input_row->addWidget(send_btn);
         right->addLayout(input_row);
+
+        planner_settings_btn_ = new QPushButton("Planner settings", this);
+        right->addWidget(planner_settings_btn_);
 
         dev_toggle_ = new QCheckBox("Developer debug", this);
         dev_toggle_->setChecked(debug_mode_enabled_);
@@ -2592,6 +2897,7 @@ class MainWindow : public QMainWindow {
             debug_text_->setVisible(checked);
             RefreshStatusIndicators();
         });
+        connect(planner_settings_btn_, &QPushButton::clicked, this, [this]() { ShowPlannerSettingsDialog(false); });
     }
 
     void SubmitManualUtterance() {
@@ -2768,6 +3074,7 @@ class MainWindow : public QMainWindow {
     QLabel* camera_label_ = nullptr;
     QPlainTextEdit* chat_history_ = nullptr;
     QLineEdit* input_line_ = nullptr;
+    QPushButton* planner_settings_btn_ = nullptr;
     QCheckBox* dev_toggle_ = nullptr;
     QPlainTextEdit* debug_text_ = nullptr;
     QLabel* mic_status_ = nullptr;
