@@ -243,6 +243,45 @@ Expected: JSON with `status: "ok"`.
 When startup initialization is still running, `/health` returns `503` with
 `status: "initializing"` and includes startup progress/status in `startup`.
 
+## Release readiness workflow
+
+MiMoCA now uses a strict release readiness gate before release builds:
+
+1. Complete and check off `scripts/release_checklist.md`.
+2. Run automated smoke checks (non-interactive):
+
+```bash
+python3 scripts/smoke_release.py
+```
+
+This writes `artifacts/readiness/smoke_report.json`.
+
+3. Run manual full-scenario QA script:
+
+```bash
+python3 scripts/manual_qa_scenario.py --init --tester "<name>"
+# fill pass/fail + notes in artifacts/readiness/manual_qa_report.json
+python3 scripts/manual_qa_scenario.py --validate
+```
+
+4. Validate the release gate explicitly:
+
+```bash
+python3 scripts/release_gate.py \
+  --checklist scripts/release_checklist.md \
+  --smoke-report artifacts/readiness/smoke_report.json \
+  --manual-report artifacts/readiness/manual_qa_report.json
+```
+
+5. Build Release:
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+```
+
+For `Release` builds, CMake now enforces readiness automatically by wiring `mimoca_release_readiness` as a dependency of `mimoca`. Build fails if smoke/manual/checklist requirements are not satisfied.
+
 ### STT path (buffered WAV)
 
 ```bash
