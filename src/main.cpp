@@ -6,6 +6,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <fstream>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -50,11 +51,16 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <Audioclient.h>
+#include <Mmdeviceapi.h>
 #include <wincred.h>
 #include <dpapi.h>
 #include <sapi.h>
 #include <sphelper.h>
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Ole32.lib")
+#pragma comment(lib, "Mmdevapi.lib")
+#pragma comment(lib, "Audioclient.lib")
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "Crypt32.lib")
 #else
@@ -181,6 +187,7 @@ struct SttResult {
 struct StreamingSttChunkResult {
     bool ok = false;
     bool speech_started = false;
+    bool speech_ended = false;
     bool speech_active = false;
     bool is_final = false;
     bool vad_available = true;
@@ -1964,15 +1971,16 @@ StreamingSttChunkResult AppendStreamingSttChunk(const std::string& host,
 
     std::string response;
     if (!SendHttpRequest(host, port, request, response)) {
-        return StreamingSttChunkResult{false, false, false, false, true, "", "sidecar_unreachable"};
+        return StreamingSttChunkResult{false, false, false, false, false, true, "", "sidecar_unreachable"};
     }
     const std::string response_body = ExtractHttpBody(response);
     if (response.find("200 OK") == std::string::npos || response_body.empty()) {
-        return StreamingSttChunkResult{false, false, false, false, true, "", "stt_chunk_http_error"};
+        return StreamingSttChunkResult{false, false, false, false, false, true, "", "stt_chunk_http_error"};
     }
     return StreamingSttChunkResult{
         true,
         ExtractJsonFieldBool(response_body, "speech_started", false),
+        ExtractJsonFieldBool(response_body, "speech_ended", false),
         ExtractJsonFieldBool(response_body, "speech_active", false),
         ExtractJsonFieldBool(response_body, "is_final", false),
         ExtractJsonFieldBool(response_body, "vad_available", true),
@@ -2222,6 +2230,246 @@ bool IsSupportedGestureLabel(const std::string& label) {
     return label == "next" || label == "repeat" || label == "option_a" || label == "option_b" || label == "none";
 }
 
+
+
+#ifdef _WIN32
+class WasapiMicCapture {
+   public:
+    using ChunkCallback = std::function<void(const std::vector<uint8_t>&, int)>;
+
+    ~WasapiMicCapture() {
+        Stop();
+    }
+
+    bool Start(const ChunkCallback& callback) {
+        if (running_) {
+            return true;
+        }
+        callback_ = callback;
+        stop_requested_ = false;
+        capture_thread_ = std::thread([this]() { CaptureLoop(); });
+        return true;
+    }
+
+    void Stop() {
+        stop_requested_ = true;
+        if (capture_thread_.joinable()) {
+            capture_thread_.join();
+        }
+        running_ = false;
+    }
+
+    bool running() const { return running_; }
+    int sample_rate_hz() const { return sample_rate_hz_; }
+
+   private:
+    void CaptureLoop() {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool uninit = SUCCEEDED(hr);
+
+        IMMDeviceEnumerator* enumerator = nullptr;
+        IMMDevice* device = nullptr;
+        IAudioClient* audio_client = nullptr;
+        IAudioCaptureClient* capture_client = nullptr;
+        WAVEFORMATEX* mix_format = nullptr;
+        HANDLE capture_event = nullptr;
+
+        auto cleanup = [&]() {
+            if (capture_event != nullptr) {
+                CloseHandle(capture_event);
+            }
+            if (mix_format != nullptr) {
+                CoTaskMemFree(mix_format);
+            }
+            if (capture_client != nullptr) {
+                capture_client->Release();
+            }
+            if (audio_client != nullptr) {
+                audio_client->Release();
+            }
+            if (device != nullptr) {
+                device->Release();
+            }
+            if (enumerator != nullptr) {
+                enumerator->Release();
+            }
+            if (uninit) {
+                CoUninitialize();
+            }
+        };
+
+        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                              reinterpret_cast<void**>(&enumerator));
+        if (FAILED(hr) || enumerator == nullptr) {
+            Log("WASAPI capture unavailable: cannot create MMDeviceEnumerator.");
+            cleanup();
+            return;
+        }
+        hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device);
+        if (FAILED(hr) || device == nullptr) {
+            Log("WASAPI capture unavailable: default capture endpoint not found.");
+            cleanup();
+            return;
+        }
+        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&audio_client));
+        if (FAILED(hr) || audio_client == nullptr) {
+            Log("WASAPI capture unavailable: failed to activate audio client.");
+            cleanup();
+            return;
+        }
+        hr = audio_client->GetMixFormat(&mix_format);
+        if (FAILED(hr) || mix_format == nullptr) {
+            Log("WASAPI capture unavailable: failed to query mix format.");
+            cleanup();
+            return;
+        }
+
+        sample_rate_hz_ = static_cast<int>(mix_format->nSamplesPerSec);
+        capture_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (capture_event == nullptr) {
+            Log("WASAPI capture unavailable: failed to create capture event.");
+            cleanup();
+            return;
+        }
+
+        hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                      0,
+                                      0,
+                                      mix_format,
+                                      nullptr);
+        if (FAILED(hr)) {
+            Log("WASAPI capture unavailable: audio client initialize failed.");
+            cleanup();
+            return;
+        }
+        hr = audio_client->SetEventHandle(capture_event);
+        if (FAILED(hr)) {
+            Log("WASAPI capture unavailable: SetEventHandle failed.");
+            cleanup();
+            return;
+        }
+        hr = audio_client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&capture_client));
+        if (FAILED(hr) || capture_client == nullptr) {
+            Log("WASAPI capture unavailable: capture service unavailable.");
+            cleanup();
+            return;
+        }
+        hr = audio_client->Start();
+        if (FAILED(hr)) {
+            Log("WASAPI capture unavailable: could not start capture.");
+            cleanup();
+            return;
+        }
+
+        running_ = true;
+        Log("WASAPI capture started at " + std::to_string(sample_rate_hz_) + " Hz.");
+
+        while (!stop_requested_) {
+            const DWORD wait = WaitForSingleObject(capture_event, 200);
+            if (wait != WAIT_OBJECT_0) {
+                continue;
+            }
+            UINT32 packet_frames = 0;
+            hr = capture_client->GetNextPacketSize(&packet_frames);
+            if (FAILED(hr)) {
+                break;
+            }
+
+            while (packet_frames > 0 && !stop_requested_) {
+                BYTE* data = nullptr;
+                UINT32 frames = 0;
+                DWORD flags = 0;
+                hr = capture_client->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
+                if (FAILED(hr)) {
+                    break;
+                }
+                if (frames > 0) {
+                    std::vector<uint8_t> pcm_mono;
+                    if (ConvertToMonoPcm16(*mix_format, data, frames, flags, pcm_mono) && !pcm_mono.empty() && callback_) {
+                        callback_(pcm_mono, sample_rate_hz_);
+                    }
+                }
+                capture_client->ReleaseBuffer(frames);
+                hr = capture_client->GetNextPacketSize(&packet_frames);
+                if (FAILED(hr)) {
+                    break;
+                }
+            }
+        }
+
+        audio_client->Stop();
+        running_ = false;
+        Log("WASAPI capture stopped.");
+        cleanup();
+    }
+
+    static bool ConvertToMonoPcm16(const WAVEFORMATEX& wf,
+                                   const BYTE* data,
+                                   const UINT32 frames,
+                                   const DWORD flags,
+                                   std::vector<uint8_t>& out_pcm) {
+        out_pcm.clear();
+        const int channels = std::max(1, static_cast<int>(wf.nChannels));
+        if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0) {
+            out_pcm.assign(static_cast<size_t>(frames) * 2U, 0);
+            return true;
+        }
+
+        if (wf.wFormatTag == WAVE_FORMAT_PCM && wf.wBitsPerSample == 16) {
+            const int16_t* samples = reinterpret_cast<const int16_t*>(data);
+            out_pcm.reserve(static_cast<size_t>(frames) * 2U);
+            for (UINT32 i = 0; i < frames; ++i) {
+                int sum = 0;
+                for (int c = 0; c < channels; ++c) {
+                    sum += samples[static_cast<size_t>(i) * static_cast<size_t>(channels) + static_cast<size_t>(c)];
+                }
+                const int16_t mono = static_cast<int16_t>(sum / channels);
+                out_pcm.push_back(static_cast<uint8_t>(mono & 0xFF));
+                out_pcm.push_back(static_cast<uint8_t>((mono >> 8) & 0xFF));
+            }
+            return true;
+        }
+
+        if (wf.wFormatTag == WAVE_FORMAT_IEEE_FLOAT && wf.wBitsPerSample == 32) {
+            const float* samples = reinterpret_cast<const float*>(data);
+            out_pcm.reserve(static_cast<size_t>(frames) * 2U);
+            for (UINT32 i = 0; i < frames; ++i) {
+                float sum = 0.0f;
+                for (int c = 0; c < channels; ++c) {
+                    sum += samples[static_cast<size_t>(i) * static_cast<size_t>(channels) + static_cast<size_t>(c)];
+                }
+                const float mono_f = std::clamp(sum / static_cast<float>(channels), -1.0f, 1.0f);
+                const int16_t mono = static_cast<int16_t>(mono_f * 32767.0f);
+                out_pcm.push_back(static_cast<uint8_t>(mono & 0xFF));
+                out_pcm.push_back(static_cast<uint8_t>((mono >> 8) & 0xFF));
+            }
+            return true;
+        }
+
+        Log("WASAPI capture format unsupported: bits=" + std::to_string(wf.wBitsPerSample));
+        return false;
+    }
+
+    std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> running_{false};
+    std::thread capture_thread_;
+    ChunkCallback callback_;
+    int sample_rate_hz_ = 16000;
+};
+#else
+class WasapiMicCapture {
+   public:
+    using ChunkCallback = std::function<void(const std::vector<uint8_t>&, int)>;
+    bool Start(const ChunkCallback& callback) {
+        (void)callback;
+        return false;
+    }
+    void Stop() {}
+    bool running() const { return false; }
+    int sample_rate_hz() const { return 16000; }
+};
+#endif
 class SpeechInputAdapter {
    public:
     virtual ~SpeechInputAdapter() = default;
@@ -2233,6 +2481,45 @@ class SpeechInputAdapter {
 class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
    public:
     SidecarSpeechInputAdapter(std::string host, const int port) : host_(std::move(host)), port_(port) {}
+
+    ~SidecarSpeechInputAdapter() override {
+        mic_capture_.Stop();
+    }
+
+    bool StartConversation() {
+#ifdef _WIN32
+        if (!mic_capture_.running()) {
+            const bool started = mic_capture_.Start([this](const std::vector<uint8_t>& pcm, const int sample_rate_hz) {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                sample_rate_hz_ = sample_rate_hz;
+                pending_pcm_chunks_.push_back(pcm);
+                if (pending_pcm_chunks_.size() > 256) {
+                    pending_pcm_chunks_.pop_front();
+                }
+            });
+            if (!started) {
+                Log("WASAPI microphone capture unavailable; speech turns disabled.");
+                return false;
+            }
+        }
+
+        if (session_id_.empty()) {
+            std::string session_id;
+            if (!StartStreamingSttSession(host_, port_, sample_rate_hz_, session_id)) {
+                return false;
+            }
+            session_id_ = session_id;
+            Log("STT streaming session started.");
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    void OnSidecarRestarted() {
+        session_id_.clear();
+    }
 
     bool TryConsumeConsoleLine(const std::string& line, TranscriptEvent& out_event) override {
         const std::string prefix = "stt-file ";
@@ -2255,61 +2542,62 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
             out_event = TranscriptEvent{stt.text, stt.is_final};
             return true;
         }
-
         return false;
     }
 
     std::string Name() const override {
-        return "python-sidecar-faster-whisper (live mic polling + stt-file/stt-stream-file debug)";
+        return "python-sidecar-faster-whisper (WASAPI mic streaming + optional stt-file debug)";
     }
 
     bool TryConsumeLiveMicrophoneFinalizedEvent(TtsController& tts, TranscriptEvent& out_event) override {
-        if (!live_mic_supported_) {
+        out_event = TranscriptEvent{};
+        if (!StartConversation()) {
             return false;
         }
-        const std::string endpoint = EnvOrDefault("MIMOCA_STT_LIVE_FINALIZED_ENDPOINT", "/stt/live/finalized");
-        const std::string body = "{}";
-        const std::string request =
-            "POST " + endpoint + " HTTP/1.1\r\n"
-            "Host: " + host_ +
-            "\r\n"
-            "Content-Type: application/json\r\n"
-            "Connection: close\r\n"
-            "Content-Length: " +
-            std::to_string(body.size()) + "\r\n\r\n" + body;
 
-        std::string response;
-        if (!SendHttpRequest(host_, port_, request, response)) {
-            if (!live_mic_warning_emitted_) {
-                Log("Live mic polling endpoint unavailable; continuing without speech-driven turns.");
-                live_mic_warning_emitted_ = true;
+        std::vector<std::vector<uint8_t>> chunks;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            while (!pending_pcm_chunks_.empty()) {
+                chunks.push_back(std::move(pending_pcm_chunks_.front()));
+                pending_pcm_chunks_.pop_front();
             }
-            live_mic_supported_ = false;
+        }
+        if (chunks.empty()) {
             return false;
         }
 
-        const std::string response_body = ExtractHttpBody(response);
-        if (response.find("200 OK") == std::string::npos || response_body.empty()) {
-            if (!live_mic_warning_emitted_) {
-                Log("Live mic polling returned non-200; disabling live mic turns for this run.");
-                live_mic_warning_emitted_ = true;
+        bool saw_final = false;
+        std::string final_text;
+        for (const auto& chunk : chunks) {
+            if (chunk.empty()) {
+                continue;
             }
-            live_mic_supported_ = false;
+            const StreamingSttChunkResult chunk_result = AppendStreamingSttChunk(host_, port_, session_id_, chunk);
+            if (!chunk_result.ok) {
+                session_id_.clear();
+                if (!stt_error_logged_) {
+                    Log("Live mic streaming chunk failed: " + chunk_result.error);
+                    stt_error_logged_ = true;
+                }
+                return false;
+            }
+            stt_error_logged_ = false;
+            if (chunk_result.speech_started) {
+                tts.Stop();
+            }
+            if ((chunk_result.speech_ended || chunk_result.is_final) && !chunk_result.text.empty()) {
+                saw_final = true;
+                final_text = chunk_result.text;
+            }
+        }
+
+        if (!saw_final) {
             return false;
         }
 
-        if (ExtractJsonFieldBool(response_body, "speech_started", false)) {
-            tts.Stop();
-        }
-        if (!ExtractJsonFieldBool(response_body, "is_final", false)) {
-            return false;
-        }
-        const std::string text = Trim(ExtractJsonFieldString(response_body, "text"));
-        if (text.empty()) {
-            return false;
-        }
-        out_event = TranscriptEvent{text, true};
-        return true;
+        out_event = TranscriptEvent{Trim(final_text), true};
+        return !out_event.text.empty();
     }
 
     bool TryStreamWavWithVadInterruption(const std::string& line, TtsController& tts, TranscriptEvent& out_event) const {
@@ -2362,11 +2650,8 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
                 tts.Stop();
                 interrupted = true;
             }
-            if (chunk_result.is_final && !chunk_result.text.empty()) {
-                if (!utterance_text.empty()) {
-                    utterance_text += " ";
-                }
-                utterance_text += chunk_result.text;
+            if ((chunk_result.speech_ended || chunk_result.is_final) && !chunk_result.text.empty()) {
+                utterance_text = chunk_result.text;
             }
         }
 
@@ -2385,8 +2670,12 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
    private:
     std::string host_;
     int port_;
-    bool live_mic_supported_ = true;
-    bool live_mic_warning_emitted_ = false;
+    mutable std::mutex queue_mutex_;
+    std::deque<std::vector<uint8_t>> pending_pcm_chunks_;
+    std::string session_id_;
+    int sample_rate_hz_ = 16000;
+    bool stt_error_logged_ = false;
+    WasapiMicCapture mic_capture_;
 };
 
 class DebugConsoleInput {
@@ -2632,6 +2921,11 @@ class MainWindow : public QMainWindow {
         }
 
         sidecar_ok_ = sidecar_manager_.EnsureReady(options, progress);
+        if (sidecar_ok_) {
+            if (!speech_input_.StartConversation()) {
+                AppendChat("system", "Microphone capture unavailable. Voice turn automation is disabled.");
+            }
+        }
         if (sidecar_manager_.runtime_missing()) {
             AppendChat("system",
                        "Speech/vision sidecar unavailable: Python runtime not found. Install Python 3.11+ and set "
@@ -2965,10 +3259,15 @@ class MainWindow : public QMainWindow {
                 }
             }
         }
+        const bool sidecar_previously_ok = sidecar_ok_;
         sidecar_ok_ = sidecar_manager_.PollAndRestartIfNeeded([this](const std::string& message) {
             statusBar()->showMessage(QString::fromStdString(message), 3000);
             Log(message);
         });
+        if (sidecar_ok_ && !sidecar_previously_ok) {
+            speech_input_.OnSidecarRestarted();
+            speech_input_.StartConversation();
+        }
         if (sidecar_ok_) {
             const SidecarHealthStatus health = QueryPythonHealth("127.0.0.1", 8080);
             planner_mode_ = health.planner_mode;
