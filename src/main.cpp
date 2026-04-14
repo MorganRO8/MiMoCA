@@ -5,10 +5,13 @@
 #include <cwchar>
 #include <cwctype>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <sstream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -48,7 +51,10 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -728,6 +734,23 @@ std::string Trim(const std::string& text) {
     return text.substr(start, end - start);
 }
 
+int EnvIntOrDefault(const char* name, const int fallback) {
+    const std::string raw = Trim(EnvOrDefault(name, ""));
+    if (raw.empty()) {
+        return fallback;
+    }
+    const char* begin = raw.c_str();
+    char* end = nullptr;
+    const long parsed = std::strtol(begin, &end, 10);
+    if (end == begin || (end != nullptr && *end != '\0')) {
+        return fallback;
+    }
+    if (parsed < std::numeric_limits<int>::min() || parsed > std::numeric_limits<int>::max()) {
+        return fallback;
+    }
+    return static_cast<int>(parsed);
+}
+
 std::string SerializeTurnContext(const TurnContext& tc) {
     std::string json = "{";
     json += "\"timestamp\":\"" + EscapeJson(tc.timestamp) + "\",";
@@ -914,6 +937,200 @@ bool CheckPythonHealth(const std::string& host, int port) {
     Log("Sidecar response preview: " + response.substr(0, std::min<size_t>(response.size(), 180)));
     return ok;
 }
+
+class PythonSidecarManager {
+   public:
+    struct StartOptions {
+        std::string host = "127.0.0.1";
+        int port = 8080;
+        std::string python_path = "python";
+        std::string script_path = "python/service.py";
+        int startup_retries = 20;
+        int startup_retry_delay_ms = 250;
+    };
+
+    using ProgressCallback = std::function<void(const std::string&)>;
+
+    bool EnsureReady(const StartOptions& options, const ProgressCallback& progress_callback) {
+        options_ = options;
+        runtime_missing_ = false;
+        runtime_missing_message_.clear();
+
+        progress_callback("Initializing speech/vision services…");
+        if (CheckPythonHealth(options.host, options.port)) {
+            ready_ = true;
+            progress_callback("Speech/vision services ready.");
+            return true;
+        }
+
+        progress_callback("Launching local speech/vision sidecar…");
+        if (!Spawn(options)) {
+            ready_ = false;
+            runtime_missing_ = true;
+            runtime_missing_message_ =
+                "Python runtime missing or not executable. Install Python 3.11+ and set MIMOCA_PYTHON_EXECUTABLE.";
+            progress_callback(runtime_missing_message_);
+            return false;
+        }
+
+        for (int attempt = 1; attempt <= options.startup_retries; ++attempt) {
+            progress_callback("Initializing speech/vision services… (" + std::to_string(attempt) + "/" +
+                              std::to_string(options.startup_retries) + ")");
+            if (CheckPythonHealth(options.host, options.port)) {
+                ready_ = true;
+                progress_callback("Speech/vision services ready.");
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(options.startup_retry_delay_ms));
+        }
+
+        ready_ = false;
+        progress_callback("Speech/vision services are offline; using recipe-only fallback.");
+        return false;
+    }
+
+    bool PollAndRestartIfNeeded(const ProgressCallback& progress_callback) {
+        if (runtime_missing_) {
+            ready_ = false;
+            return false;
+        }
+        if (IsManagedProcessAlive()) {
+            ready_ = CheckPythonHealth(options_.host, options_.port);
+            return ready_;
+        }
+        if (!is_spawned_) {
+            ready_ = CheckPythonHealth(options_.host, options_.port);
+            return ready_;
+        }
+
+        progress_callback("Speech/vision service stopped unexpectedly; restarting…");
+        ready_ = EnsureReady(options_, progress_callback);
+        return ready_;
+    }
+
+    void Shutdown() {
+        ready_ = false;
+        if (!is_spawned_) {
+            return;
+        }
+        Log("Stopping Python sidecar process.");
+#ifdef _WIN32
+        if (process_info_.hProcess != nullptr) {
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_info_.dwProcessId);
+            if (WaitForSingleObject(process_info_.hProcess, 1500) == WAIT_TIMEOUT) {
+                TerminateProcess(process_info_.hProcess, 0);
+                WaitForSingleObject(process_info_.hProcess, 1000);
+            }
+            CloseHandle(process_info_.hThread);
+            CloseHandle(process_info_.hProcess);
+            process_info_ = {};
+        }
+#else
+        if (child_pid_ > 0) {
+            kill(child_pid_, SIGTERM);
+            int status = 0;
+            for (int attempt = 0; attempt < 20; ++attempt) {
+                const pid_t result = waitpid(child_pid_, &status, WNOHANG);
+                if (result == child_pid_) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (waitpid(child_pid_, &status, WNOHANG) == 0) {
+                kill(child_pid_, SIGKILL);
+                waitpid(child_pid_, &status, 0);
+            }
+            child_pid_ = -1;
+        }
+#endif
+        is_spawned_ = false;
+    }
+
+    bool ready() const { return ready_; }
+    bool runtime_missing() const { return runtime_missing_; }
+    const std::string& runtime_missing_message() const { return runtime_missing_message_; }
+
+   private:
+    bool Spawn(const StartOptions& options) {
+#ifdef _WIN32
+        std::string command_line = "\"" + options.python_path + "\" \"" + options.script_path + "\"";
+        STARTUPINFOA startup_info{};
+        startup_info.cb = sizeof(startup_info);
+        ZeroMemory(&process_info_, sizeof(process_info_));
+        std::vector<char> mutable_command(command_line.begin(), command_line.end());
+        mutable_command.push_back('\0');
+        if (!CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NEW_PROCESS_GROUP, nullptr,
+                            nullptr, &startup_info, &process_info_)) {
+            Log("Failed to spawn sidecar with command: " + command_line);
+            return false;
+        }
+        is_spawned_ = true;
+        Log("Spawned Python sidecar process.");
+        return true;
+#else
+        const pid_t pid = fork();
+        if (pid < 0) {
+            Log("Failed to fork sidecar process.");
+            return false;
+        }
+        if (pid == 0) {
+            execlp(options.python_path.c_str(), options.python_path.c_str(), options.script_path.c_str(),
+                   static_cast<char*>(nullptr));
+            _exit(127);
+        }
+        child_pid_ = pid;
+        is_spawned_ = true;
+        Log("Spawned Python sidecar process (pid=" + std::to_string(static_cast<long long>(pid)) + ").");
+        return true;
+#endif
+    }
+
+    bool IsManagedProcessAlive() {
+        if (!is_spawned_) {
+            return false;
+        }
+#ifdef _WIN32
+        if (process_info_.hProcess == nullptr) {
+            return false;
+        }
+        DWORD exit_code = 0;
+        if (!GetExitCodeProcess(process_info_.hProcess, &exit_code)) {
+            return false;
+        }
+        if (exit_code != STILL_ACTIVE) {
+            CloseHandle(process_info_.hThread);
+            CloseHandle(process_info_.hProcess);
+            process_info_ = {};
+            is_spawned_ = false;
+            return false;
+        }
+        return true;
+#else
+        if (child_pid_ <= 0) {
+            return false;
+        }
+        int status = 0;
+        const pid_t result = waitpid(child_pid_, &status, WNOHANG);
+        if (result == child_pid_) {
+            child_pid_ = -1;
+            is_spawned_ = false;
+            return false;
+        }
+        return result == 0;
+#endif
+    }
+
+    StartOptions options_{};
+    bool ready_ = false;
+    bool is_spawned_ = false;
+    bool runtime_missing_ = false;
+    std::string runtime_missing_message_;
+#ifdef _WIN32
+    PROCESS_INFORMATION process_info_{};
+#else
+    pid_t child_pid_ = -1;
+#endif
+};
 
 std::string MakeIsoTimestampNow() {
     const auto now = std::chrono::system_clock::now();
@@ -2022,8 +2239,6 @@ class MainWindow : public QMainWindow {
     MainWindow() {
         setWindowTitle("MiMoCA");
         resize(1280, 760);
-
-        sidecar_ok_ = CheckPythonHealth("127.0.0.1", 8080);
         if (!LoadFirstRecipe("assets/recipes.json", recipe_state_.recipe)) {
             Log("Failed to load startup recipe; exiting.");
             startup_failed_ = true;
@@ -2035,6 +2250,7 @@ class MainWindow : public QMainWindow {
         debug_mode_enabled_ = debug_env == "1" || debug_env == "true" || debug_env == "on";
 
         SetupUi();
+        InitializeSidecarWithProgress();
         camera_.Start(0);
         RefreshStatusIndicators();
 
@@ -2046,9 +2262,38 @@ class MainWindow : public QMainWindow {
         AppendChat("system", "UI ready. Ask 'what next?' by voice or type below.");
     }
 
+    ~MainWindow() override {
+        sidecar_manager_.Shutdown();
+    }
+
     bool StartupFailed() const { return startup_failed_; }
 
    private:
+    void InitializeSidecarWithProgress() {
+        PythonSidecarManager::StartOptions options;
+        options.host = EnvOrDefault("MIMOCA_SIDECAR_HOST", "127.0.0.1");
+        options.port = EnvIntOrDefault("MIMOCA_SIDECAR_PORT", 8080);
+        options.python_path = EnvOrDefault("MIMOCA_PYTHON_EXECUTABLE", "python");
+        options.script_path = EnvOrDefault("MIMOCA_SIDECAR_SCRIPT", "python/service.py");
+        options.startup_retries = EnvIntOrDefault("MIMOCA_SIDECAR_HEALTH_RETRIES", 20);
+        options.startup_retry_delay_ms = EnvIntOrDefault("MIMOCA_SIDECAR_HEALTH_RETRY_MS", 250);
+
+        const auto progress = [this](const std::string& message) {
+            statusBar()->showMessage(QString::fromStdString(message));
+            sidecar_status_->setText(("sidecar: " + message).c_str());
+            QApplication::processEvents();
+            Log(message);
+        };
+
+        sidecar_ok_ = sidecar_manager_.EnsureReady(options, progress);
+        if (sidecar_manager_.runtime_missing()) {
+            AppendChat("system",
+                       "Speech/vision sidecar unavailable: Python runtime not found. Install Python 3.11+ and set "
+                       "MIMOCA_PYTHON_EXECUTABLE.");
+        }
+        statusBar()->clearMessage();
+    }
+
     void SetupUi() {
         auto* central = new QWidget(this);
         auto* root = new QHBoxLayout(central);
@@ -2162,6 +2407,13 @@ class MainWindow : public QMainWindow {
                     gesture_active_ = detected_gesture.label != "none" && detected_gesture.confidence >= 0.6;
                 }
             }
+        }
+        sidecar_ok_ = sidecar_manager_.PollAndRestartIfNeeded([this](const std::string& message) {
+            statusBar()->showMessage(QString::fromStdString(message), 3000);
+            Log(message);
+        });
+        if (!sidecar_ok_ && sidecar_manager_.runtime_missing()) {
+            sidecar_status_->setText("sidecar: python runtime missing (see log)");
         }
         RefreshStatusIndicators();
     }
@@ -2297,6 +2549,7 @@ class MainWindow : public QMainWindow {
     DebugSnapshot debug_snapshot_{};
     TtsController tts_;
     SidecarSpeechInputAdapter speech_input_{"127.0.0.1", 8080};
+    PythonSidecarManager sidecar_manager_{};
     CameraController camera_;
 };
 
