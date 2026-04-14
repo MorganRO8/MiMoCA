@@ -33,7 +33,11 @@ def _python_compile(repo: pathlib.Path) -> CheckResult:
 
 
 def _cmake_configure(repo: pathlib.Path, build_dir: pathlib.Path) -> CheckResult:
-    ok, out = _run(["cmake", "-S", ".", "-B", str(build_dir)], repo)
+    cmd = ["cmake", "-S", ".", "-B", str(build_dir)]
+    if os.name == "nt":
+        # Keep smoke builds aligned with the supported Windows-first toolchain.
+        cmd.extend(["-G", "Visual Studio 17 2022", "-T", "v143", "-A", "x64", "-DCMAKE_SYSTEM_VERSION=10.0"])
+    ok, out = _run(cmd, repo)
     return CheckResult("cmake_configure", ok, out)
 
 

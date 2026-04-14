@@ -52,18 +52,14 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#if defined(MIMOCA_HAS_WASAPI) && MIMOCA_HAS_WASAPI
 #include <Audioclient.h>
 #include <Mmdeviceapi.h>
+#endif
 #include <wincred.h>
 #include <dpapi.h>
 #include <sapi.h>
 #include <sphelper.h>
-#pragma comment(lib, "Ws2_32.lib")
-#pragma comment(lib, "Ole32.lib")
-#pragma comment(lib, "Mmdevapi.lib")
-#pragma comment(lib, "Audioclient.lib")
-#pragma comment(lib, "Advapi32.lib")
-#pragma comment(lib, "Crypt32.lib")
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -2427,7 +2423,7 @@ bool IsSupportedGestureLabel(const std::string& label) {
 
 
 
-#ifdef _WIN32
+#if defined(_WIN32) && defined(MIMOCA_HAS_WASAPI) && MIMOCA_HAS_WASAPI
 class WasapiMicCapture {
    public:
     using ChunkCallback = std::function<void(const std::vector<uint8_t>&, int)>;
