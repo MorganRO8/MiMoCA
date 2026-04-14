@@ -177,8 +177,21 @@ On Windows builds with Qt6 available, startup opens the primary UI directly:
 - status indicators for mic, gesture, planner, and sidecar health
 - developer-only debug toggle panel
 - planner settings button for API key update/revoke
+- runtime settings button for modality toggles + planner mode (`llm`/`mock`)
 
 If planner mode is `llm` and no valid key is available at startup, the UI prompts for an OpenAI API key, validates it, and stores it in Windows Credential Manager + DPAPI (not plaintext config). Optional “skip for now (mock mode)” is shown only when `MIMOCA_ALLOW_PLANNER_SKIP_TO_MOCK=true`.
+
+### Runtime configuration source
+
+MiMoCA now uses a single app-managed runtime profile file (default: `mimoca_app_config.json`, override path via `MIMOCA_APP_CONFIG_PATH`) for app + sidecar integration settings:
+
+- `sidecar` (host, port, script path)
+- `modalities` (`speech_enabled`, `vision_enabled`, `gesture_enabled`, `tts_enabled`)
+- `planner` (`mode`, `provider`, `base_url`, `model`)
+- `model_paths` (`stt_model`, `vision_model`, `gesture_model_path`)
+- `debug` (`overlay_enabled`)
+
+Environment variables are treated as runtime overrides only. Planner API keys remain separate from this file and are stored in secure OS storage (Windows Credential Manager + DPAPI).
 
 Manual debug/console commands are no longer required for primary operation in that mode.
 On non-Qt builds, the executable prints a fallback message and exits.

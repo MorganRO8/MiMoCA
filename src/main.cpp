@@ -25,6 +25,7 @@
 #ifdef MIMOCA_HAS_QT
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -235,7 +236,21 @@ struct RuntimeIntent {
 
 struct AppConfig {
     std::string sidecar_env_path;
+    std::string sidecar_host = "127.0.0.1";
+    int sidecar_port = 8080;
+    std::string sidecar_script_path = "python/service.py";
+    bool speech_enabled = true;
+    bool vision_enabled = true;
+    bool gesture_enabled = true;
+    bool tts_enabled = true;
     std::string planner_mode = "llm";
+    std::string planner_provider = "openai_compatible";
+    std::string llm_base_url = "https://api.openai.com/v1";
+    std::string llm_model = "gpt-4o-mini";
+    std::string stt_model = "distil-large-v3";
+    std::string vision_model = "yolov8s-worldv2.pt";
+    std::string gesture_model_path = "python/models/hand_landmarker.task";
+    bool debug_overlay_enabled = false;
 };
 
 struct SidecarBootstrapResult {
@@ -802,6 +817,31 @@ std::string DefaultAppConfigPath() {
     return EnvOrDefault("MIMOCA_APP_CONFIG_PATH", "mimoca_app_config.json");
 }
 
+int ClampPort(const int value, const int fallback) {
+    if (value < 1 || value > 65535) {
+        return fallback;
+    }
+    return value;
+}
+
+bool ParseInt(const std::string& text, int& out_value) {
+    const std::string trimmed = Trim(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+    const char* begin = trimmed.c_str();
+    char* end = nullptr;
+    const long parsed = std::strtol(begin, &end, 10);
+    if (end == begin || (end != nullptr && *end != '\0')) {
+        return false;
+    }
+    if (parsed < std::numeric_limits<int>::min() || parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    out_value = static_cast<int>(parsed);
+    return true;
+}
+
 AppConfig LoadAppConfig(const std::string& path) {
     AppConfig config{};
     const std::string json = ReadFileText(path);
@@ -809,10 +849,61 @@ AppConfig LoadAppConfig(const std::string& path) {
         return config;
     }
     config.sidecar_env_path = Trim(ExtractJsonFieldString(json, "sidecar_env_path"));
-    config.planner_mode = ToLower(Trim(ExtractJsonFieldString(json, "planner_mode")));
+
+    const std::string sidecar_json = ExtractJsonFieldObject(json, "sidecar");
+    config.sidecar_host = Trim(ExtractJsonFieldString(sidecar_json, "host"));
+    if (config.sidecar_host.empty()) {
+        config.sidecar_host = "127.0.0.1";
+    }
+    int parsed_port = config.sidecar_port;
+    if (ParseInt(ExtractJsonFieldString(sidecar_json, "port"), parsed_port)) {
+        config.sidecar_port = ClampPort(parsed_port, 8080);
+    }
+    config.sidecar_script_path = Trim(ExtractJsonFieldString(sidecar_json, "script_path"));
+    if (config.sidecar_script_path.empty()) {
+        config.sidecar_script_path = "python/service.py";
+    }
+
+    const std::string modalities_json = ExtractJsonFieldObject(json, "modalities");
+    config.speech_enabled = ExtractJsonFieldBool(modalities_json, "speech_enabled", true);
+    config.vision_enabled = ExtractJsonFieldBool(modalities_json, "vision_enabled", true);
+    config.gesture_enabled = ExtractJsonFieldBool(modalities_json, "gesture_enabled", true);
+    config.tts_enabled = ExtractJsonFieldBool(modalities_json, "tts_enabled", true);
+
+    const std::string planner_json = ExtractJsonFieldObject(json, "planner");
+    config.planner_mode = ToLower(Trim(ExtractJsonFieldString(planner_json, "mode")));
     if (config.planner_mode != "llm" && config.planner_mode != "mock") {
         config.planner_mode = "llm";
     }
+    config.planner_provider = ToLower(Trim(ExtractJsonFieldString(planner_json, "provider")));
+    if (config.planner_provider.empty()) {
+        config.planner_provider = "openai_compatible";
+    }
+    config.llm_base_url = Trim(ExtractJsonFieldString(planner_json, "base_url"));
+    if (config.llm_base_url.empty()) {
+        config.llm_base_url = "https://api.openai.com/v1";
+    }
+    config.llm_model = Trim(ExtractJsonFieldString(planner_json, "model"));
+    if (config.llm_model.empty()) {
+        config.llm_model = "gpt-4o-mini";
+    }
+
+    const std::string models_json = ExtractJsonFieldObject(json, "model_paths");
+    const std::string stt_model = Trim(ExtractJsonFieldString(models_json, "stt_model"));
+    if (!stt_model.empty()) {
+        config.stt_model = stt_model;
+    }
+    const std::string vision_model = Trim(ExtractJsonFieldString(models_json, "vision_model"));
+    if (!vision_model.empty()) {
+        config.vision_model = vision_model;
+    }
+    const std::string gesture_model_path = Trim(ExtractJsonFieldString(models_json, "gesture_model_path"));
+    if (!gesture_model_path.empty()) {
+        config.gesture_model_path = gesture_model_path;
+    }
+
+    const std::string debug_json = ExtractJsonFieldObject(json, "debug");
+    config.debug_overlay_enabled = ExtractJsonFieldBool(debug_json, "overlay_enabled", false);
     return config;
 }
 
@@ -824,9 +915,95 @@ bool SaveAppConfig(const std::string& path, const AppConfig& config) {
     }
     output << "{\n";
     output << "  \"sidecar_env_path\": \"" << EscapeJson(config.sidecar_env_path) << "\",\n";
-    output << "  \"planner_mode\": \"" << EscapeJson(config.planner_mode) << "\"\n";
+    output << "  \"sidecar\": {\n";
+    output << "    \"host\": \"" << EscapeJson(config.sidecar_host) << "\",\n";
+    output << "    \"port\": \"" << config.sidecar_port << "\",\n";
+    output << "    \"script_path\": \"" << EscapeJson(config.sidecar_script_path) << "\"\n";
+    output << "  },\n";
+    output << "  \"modalities\": {\n";
+    output << "    \"speech_enabled\": " << BoolJson(config.speech_enabled) << ",\n";
+    output << "    \"vision_enabled\": " << BoolJson(config.vision_enabled) << ",\n";
+    output << "    \"gesture_enabled\": " << BoolJson(config.gesture_enabled) << ",\n";
+    output << "    \"tts_enabled\": " << BoolJson(config.tts_enabled) << "\n";
+    output << "  },\n";
+    output << "  \"planner\": {\n";
+    output << "    \"mode\": \"" << EscapeJson(config.planner_mode) << "\",\n";
+    output << "    \"provider\": \"" << EscapeJson(config.planner_provider) << "\",\n";
+    output << "    \"base_url\": \"" << EscapeJson(config.llm_base_url) << "\",\n";
+    output << "    \"model\": \"" << EscapeJson(config.llm_model) << "\"\n";
+    output << "  },\n";
+    output << "  \"model_paths\": {\n";
+    output << "    \"stt_model\": \"" << EscapeJson(config.stt_model) << "\",\n";
+    output << "    \"vision_model\": \"" << EscapeJson(config.vision_model) << "\",\n";
+    output << "    \"gesture_model_path\": \"" << EscapeJson(config.gesture_model_path) << "\"\n";
+    output << "  },\n";
+    output << "  \"debug\": {\n";
+    output << "    \"overlay_enabled\": " << BoolJson(config.debug_overlay_enabled) << "\n";
+    output << "  }\n";
     output << "}\n";
     return true;
+}
+
+void ApplyEnvOverrides(AppConfig& config) {
+    const std::string planner_mode = ToLower(Trim(EnvOrDefault("MIMOCA_PLANNER_MODE", "")));
+    if (planner_mode == "llm" || planner_mode == "mock") {
+        config.planner_mode = planner_mode;
+    }
+    const std::string sidecar_host = Trim(EnvOrDefault("MIMOCA_SIDECAR_HOST", ""));
+    if (!sidecar_host.empty()) {
+        config.sidecar_host = sidecar_host;
+    }
+    const int env_sidecar_port = EnvIntOrDefault("MIMOCA_SIDECAR_PORT", config.sidecar_port);
+    config.sidecar_port = ClampPort(env_sidecar_port, config.sidecar_port);
+    const std::string sidecar_script = Trim(EnvOrDefault("MIMOCA_SIDECAR_SCRIPT", ""));
+    if (!sidecar_script.empty()) {
+        config.sidecar_script_path = sidecar_script;
+    }
+    const std::string stt_model = Trim(EnvOrDefault("MIMOCA_STT_MODEL", ""));
+    if (!stt_model.empty()) {
+        config.stt_model = stt_model;
+    }
+    const std::string vision_model = Trim(EnvOrDefault("MIMOCA_VISION_MODEL", ""));
+    if (!vision_model.empty()) {
+        config.vision_model = vision_model;
+    }
+    const std::string gesture_model = Trim(EnvOrDefault("MIMOCA_GESTURE_MODEL_PATH", ""));
+    if (!gesture_model.empty()) {
+        config.gesture_model_path = gesture_model;
+    }
+    const std::string debug_env = ToLower(Trim(EnvOrDefault("MIMOCA_DEBUG", "")));
+    if (!debug_env.empty()) {
+        config.debug_overlay_enabled = debug_env == "1" || debug_env == "true" || debug_env == "on";
+    }
+}
+
+void LogEffectiveConfig(const AppConfig& config) {
+    std::ostringstream oss;
+    oss << "Effective runtime config: "
+        << "sidecar.host=" << config.sidecar_host
+        << " sidecar.port=" << config.sidecar_port
+        << " sidecar.script=" << config.sidecar_script_path
+        << " modalities[speech=" << (config.speech_enabled ? "on" : "off")
+        << ",vision=" << (config.vision_enabled ? "on" : "off")
+        << ",gesture=" << (config.gesture_enabled ? "on" : "off")
+        << ",tts=" << (config.tts_enabled ? "on" : "off") << "]"
+        << " planner.mode=" << config.planner_mode
+        << " planner.provider=" << config.planner_provider
+        << " planner.base_url=" << config.llm_base_url
+        << " planner.model=" << config.llm_model
+        << " model_paths[stt=" << config.stt_model
+        << ",vision=" << config.vision_model
+        << ",gesture=" << config.gesture_model_path << "]"
+        << " secrets[planner_api_key=redacted_secure_store]";
+    Log(oss.str());
+}
+
+void SetEnvVar(const std::string& key, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(key.c_str(), value.c_str());
+#else
+    setenv(key.c_str(), value.c_str(), 1);
+#endif
 }
 
 std::string QuoteForShell(const std::string& value) {
@@ -1716,7 +1893,8 @@ TurnContext BuildTurnContext(const RecipeState& state,
                              const std::string& utterance,
                              const Gesture& gesture,
                              const std::vector<Detection>& detections,
-                             const CameraSnapshot& camera_snapshot) {
+                             const CameraSnapshot& camera_snapshot,
+                             const Settings& runtime_settings) {
     const RecipeStep* current = GetCurrentStep(state);
     const RecipeStep* next = GetNextStep(state);
     const std::string frame_summary = camera_snapshot.frame_available
@@ -1753,7 +1931,7 @@ TurnContext BuildTurnContext(const RecipeState& state,
         HandPose{"unknown", 0.0},
         camera_snapshot.frame_available,
         frame_summary,
-        Settings{true, true, true, true},
+        runtime_settings,
     };
 }
 
@@ -2538,6 +2716,12 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
         session_id_.clear();
     }
 
+    void SetEndpoint(std::string host, const int port) {
+        host_ = std::move(host);
+        port_ = port;
+        session_id_.clear();
+    }
+
     bool ConsumeSpeechStartEvent() {
         if (!pending_speech_start_event_) {
             return false;
@@ -2915,9 +3099,6 @@ class MainWindow : public QMainWindow {
         }
         recipe_state_.current_step_index = 0;
 
-        const std::string debug_env = ToLower(Trim(EnvOrDefault("MIMOCA_DEBUG", "0")));
-        debug_mode_enabled_ = debug_env == "1" || debug_env == "true" || debug_env == "on";
-
         SetupUi();
         InitializeSidecarWithProgress();
         EnsurePlannerApiKeyAtStartup();
@@ -2942,12 +3123,28 @@ class MainWindow : public QMainWindow {
     void InitializeSidecarWithProgress() {
         app_config_path_ = DefaultAppConfigPath();
         app_config_ = LoadAppConfig(app_config_path_);
+        ApplyEnvOverrides(app_config_);
+        sidecar_host_ = app_config_.sidecar_host;
+        sidecar_port_ = app_config_.sidecar_port;
+        speech_input_.SetEndpoint(sidecar_host_, sidecar_port_);
+        debug_mode_enabled_ = app_config_.debug_overlay_enabled;
+        if (dev_toggle_ != nullptr) {
+            dev_toggle_->setChecked(debug_mode_enabled_);
+        }
+        LogEffectiveConfig(app_config_);
+        SetEnvVar("MIMOCA_STT_MODEL", app_config_.stt_model);
+        SetEnvVar("MIMOCA_VISION_MODEL", app_config_.vision_model);
+        SetEnvVar("MIMOCA_GESTURE_MODEL_PATH", app_config_.gesture_model_path);
+        SetEnvVar("MIMOCA_PLANNER_MODE", app_config_.planner_mode);
+        SetEnvVar("MIMOCA_LLM_PROVIDER", app_config_.planner_provider);
+        SetEnvVar("MIMOCA_LLM_BASE_URL", app_config_.llm_base_url);
+        SetEnvVar("MIMOCA_LLM_MODEL", app_config_.llm_model);
 
         PythonSidecarManager::StartOptions options;
-        options.host = EnvOrDefault("MIMOCA_SIDECAR_HOST", "127.0.0.1");
-        options.port = EnvIntOrDefault("MIMOCA_SIDECAR_PORT", 8080);
+        options.host = sidecar_host_;
+        options.port = sidecar_port_;
         options.python_path = ResolveManagedSidecarInterpreter();
-        options.script_path = EnvOrDefault("MIMOCA_SIDECAR_SCRIPT", "python/service.py");
+        options.script_path = app_config_.sidecar_script_path;
         options.startup_retries = EnvIntOrDefault("MIMOCA_SIDECAR_HEALTH_RETRIES", 20);
         options.startup_retry_delay_ms = EnvIntOrDefault("MIMOCA_SIDECAR_HEALTH_RETRY_MS", 250);
 
@@ -2969,7 +3166,16 @@ class MainWindow : public QMainWindow {
 
         sidecar_ok_ = sidecar_manager_.EnsureReady(options, progress);
         if (sidecar_ok_) {
-            if (!speech_input_.StartConversation()) {
+            std::string planner_key;
+            if (app_config_.planner_mode == "llm") {
+                LoadPlannerApiKeySecure(planner_key);
+            }
+            std::string planner_config_error;
+            if (!RequestPlannerConfigure(sidecar_host_, sidecar_port_, app_config_.planner_mode, planner_key,
+                                         planner_config_error)) {
+                Log("Planner mode sync failed at startup: " + planner_config_error);
+            }
+            if (app_config_.speech_enabled && !speech_input_.StartConversation()) {
                 AppendChat("system", "Microphone capture unavailable. Voice turn automation is disabled.");
             }
         }
@@ -3055,16 +3261,18 @@ class MainWindow : public QMainWindow {
             error_out = "sidecar_unavailable";
             return false;
         }
-        if (!RequestPlannerValidateKey("127.0.0.1", 8080, api_key, error_out)) {
+        if (!RequestPlannerValidateKey(sidecar_host_, sidecar_port_, api_key, error_out)) {
             return false;
         }
         if (!SavePlannerApiKeySecure(api_key)) {
             error_out = "secure_store_write_failed";
             return false;
         }
-        if (!RequestPlannerConfigure("127.0.0.1", 8080, "llm", api_key, error_out)) {
+        if (!RequestPlannerConfigure(sidecar_host_, sidecar_port_, "llm", api_key, error_out)) {
             return false;
         }
+        app_config_.planner_mode = "llm";
+        SaveAppConfig(app_config_path_, app_config_);
         sidecar_status_->setText("sidecar: planner llm configured");
         return true;
     }
@@ -3073,7 +3281,7 @@ class MainWindow : public QMainWindow {
         if (!sidecar_ok_) {
             return;
         }
-        const SidecarHealthStatus health = QueryPythonHealth("127.0.0.1", 8080);
+        const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
         planner_mode_ = health.planner_mode;
         planner_llm_configured_ = health.planner_llm_configured;
         planner_fallback_active_ = health.planner_fallback_active;
@@ -3097,7 +3305,7 @@ class MainWindow : public QMainWindow {
         const bool deleted = DeletePlannerApiKeySecure();
         std::string error;
         if (sidecar_ok_) {
-            RequestPlannerConfigure("127.0.0.1", 8080, "mock", "", error);
+            RequestPlannerConfigure(sidecar_host_, sidecar_port_, "mock", "", error);
         }
         if (!deleted) {
             QMessageBox::warning(this, "Planner key revoke", "Could not remove stored API key from secure storage.");
@@ -3168,7 +3376,7 @@ class MainWindow : public QMainWindow {
             }
             if (result == 2 && startup_required && allow_skip_to_mock) {
                 std::string configure_error;
-                if (!RequestPlannerConfigure("127.0.0.1", 8080, "mock", "", configure_error)) {
+                if (!RequestPlannerConfigure(sidecar_host_, sidecar_port_, "mock", "", configure_error)) {
                     QMessageBox::warning(this, "Planner fallback failed",
                                          QString::fromStdString("Could not switch planner to mock mode: " + configure_error));
                     continue;
@@ -3185,6 +3393,63 @@ class MainWindow : public QMainWindow {
                 continue;
             }
             return;
+        }
+    }
+
+    void ShowRuntimeSettingsDialog() {
+        QDialog dialog(this);
+        dialog.setWindowTitle("Runtime settings");
+        auto* layout = new QVBoxLayout(&dialog);
+
+        auto* speech_toggle = new QCheckBox("Voice input enabled", &dialog);
+        speech_toggle->setChecked(app_config_.speech_enabled);
+        auto* gesture_toggle = new QCheckBox("Gesture recognition enabled", &dialog);
+        gesture_toggle->setChecked(app_config_.gesture_enabled);
+        auto* vision_toggle = new QCheckBox("Vision detection enabled", &dialog);
+        vision_toggle->setChecked(app_config_.vision_enabled);
+        auto* tts_toggle = new QCheckBox("Speech output enabled", &dialog);
+        tts_toggle->setChecked(app_config_.tts_enabled);
+
+        auto* planner_label = new QLabel("Planner mode", &dialog);
+        auto* planner_mode_combo = new QComboBox(&dialog);
+        planner_mode_combo->addItem("llm");
+        planner_mode_combo->addItem("mock");
+        planner_mode_combo->setCurrentText(QString::fromStdString(app_config_.planner_mode));
+
+        layout->addWidget(speech_toggle);
+        layout->addWidget(gesture_toggle);
+        layout->addWidget(vision_toggle);
+        layout->addWidget(tts_toggle);
+        layout->addWidget(planner_label);
+        layout->addWidget(planner_mode_combo);
+
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
+        connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        layout->addWidget(buttons);
+
+        if (dialog.exec() != QDialog::Accepted) {
+            return;
+        }
+
+        app_config_.speech_enabled = speech_toggle->isChecked();
+        app_config_.gesture_enabled = gesture_toggle->isChecked();
+        app_config_.vision_enabled = vision_toggle->isChecked();
+        app_config_.tts_enabled = tts_toggle->isChecked();
+        app_config_.planner_mode = planner_mode_combo->currentText().toStdString();
+        SaveAppConfig(app_config_path_, app_config_);
+        LogEffectiveConfig(app_config_);
+
+        std::string planner_key;
+        if (app_config_.planner_mode == "llm") {
+            LoadPlannerApiKeySecure(planner_key);
+        }
+        std::string configure_error;
+        if (sidecar_ok_ &&
+            !RequestPlannerConfigure(sidecar_host_, sidecar_port_, app_config_.planner_mode, planner_key, configure_error)) {
+            AppendChat("system", "Planner mode update failed: " + configure_error);
+        } else {
+            AppendChat("system", "Runtime settings saved.");
         }
     }
 
@@ -3220,6 +3485,8 @@ class MainWindow : public QMainWindow {
 
         planner_settings_btn_ = new QPushButton("Planner settings", this);
         right->addWidget(planner_settings_btn_);
+        runtime_settings_btn_ = new QPushButton("Runtime settings", this);
+        right->addWidget(runtime_settings_btn_);
 
         dev_toggle_ = new QCheckBox("Developer debug", this);
         dev_toggle_->setChecked(debug_mode_enabled_);
@@ -3254,6 +3521,7 @@ class MainWindow : public QMainWindow {
             RefreshStatusIndicators();
         });
         connect(planner_settings_btn_, &QPushButton::clicked, this, [this]() { ShowPlannerSettingsDialog(false); });
+        connect(runtime_settings_btn_, &QPushButton::clicked, this, [this]() { ShowRuntimeSettingsDialog(); });
     }
 
     void SubmitManualUtterance() {
@@ -3293,7 +3561,8 @@ class MainWindow : public QMainWindow {
         }
 
         TranscriptEvent transcript_event{};
-        if (sidecar_ok_ && speech_input_.TryConsumeLiveMicrophoneFinalizedEvent(tts_, transcript_event) &&
+        if (sidecar_ok_ && app_config_.speech_enabled &&
+            speech_input_.TryConsumeLiveMicrophoneFinalizedEvent(tts_, transcript_event) &&
             !transcript_event.text.empty()) {
             RuntimeIntent intent{};
             intent.type = IntentFromUtterance(transcript_event.text);
@@ -3303,7 +3572,7 @@ class MainWindow : public QMainWindow {
             AppendChat("user", transcript_event.text);
             ProcessTurn(intent);
         }
-        if (speech_input_.ConsumeSpeechStartEvent()) {
+        if (app_config_.speech_enabled && speech_input_.ConsumeSpeechStartEvent()) {
             tts_.Stop();
             last_speech_start_at_ = std::chrono::steady_clock::now();
         }
@@ -3316,10 +3585,12 @@ class MainWindow : public QMainWindow {
         });
         if (sidecar_ok_ && !sidecar_previously_ok) {
             speech_input_.OnSidecarRestarted();
-            speech_input_.StartConversation();
+            if (app_config_.speech_enabled) {
+                speech_input_.StartConversation();
+            }
         }
         if (sidecar_ok_) {
-            const SidecarHealthStatus health = QueryPythonHealth("127.0.0.1", 8080);
+            const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
             planner_mode_ = health.planner_mode;
             planner_llm_configured_ = health.planner_llm_configured;
             planner_fallback_active_ = health.planner_fallback_active;
@@ -3335,7 +3606,7 @@ class MainWindow : public QMainWindow {
 
     void MaybeProcessGestureIntent() {
         const auto now = std::chrono::steady_clock::now();
-        if (!sidecar_ok_) {
+        if (!sidecar_ok_ || !app_config_.gesture_enabled) {
             gesture_status_text_ = "offline";
             return;
         }
@@ -3353,7 +3624,7 @@ class MainWindow : public QMainWindow {
         }
 
         Gesture detected_gesture{"none", 0.0};
-        if (!RequestGestureDetection("127.0.0.1", 8080, latest_frame_jpeg, detected_gesture)) {
+        if (!RequestGestureDetection(sidecar_host_, sidecar_port_, latest_frame_jpeg, detected_gesture)) {
             gesture_status_text_ = "detect-error";
             gesture_active_ = false;
             return;
@@ -3427,9 +3698,9 @@ class MainWindow : public QMainWindow {
         const CameraSnapshot camera_snapshot = camera_.GetLatestSnapshot();
         std::vector<Detection> turn_detections;
         std::vector<uint8_t> latest_frame_jpeg;
-        const bool has_jpeg = sidecar_ok_ && camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg);
+        const bool has_jpeg = sidecar_ok_ && app_config_.vision_enabled && camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg);
         if (has_jpeg) {
-            RequestVisionDetections("127.0.0.1", 8080, latest_frame_jpeg, turn_detections);
+            RequestVisionDetections(sidecar_host_, sidecar_port_, latest_frame_jpeg, turn_detections);
         }
 
         std::string utterance = intent.utterance;
@@ -3441,13 +3712,14 @@ class MainWindow : public QMainWindow {
 
         PlannerResponse response{};
         PlannerRoundTripStatus planner_status{};
-        const TurnContext turn_context = BuildTurnContext(recipe_state_, utterance, turn_gesture, turn_detections, camera_snapshot);
+        const TurnContext turn_context =
+            BuildTurnContext(recipe_state_, utterance, turn_gesture, turn_detections, camera_snapshot, RuntimeSettings());
 
         if (sidecar_ok_) {
             planner_status.attempted = true;
             planner_status.source = "python_sidecar";
             const auto planner_start = std::chrono::steady_clock::now();
-            if (!RequestMockPlanner("127.0.0.1", 8080, turn_context, response)) {
+            if (!RequestMockPlanner(sidecar_host_, sidecar_port_, turn_context, response)) {
                 response = LocalRecipeFallback(recipe_state_, FallbackCommandForIntent(intent));
                 planner_status.success = false;
                 planner_status.used_fallback = true;
@@ -3468,7 +3740,7 @@ class MainWindow : public QMainWindow {
         if (!response.assistant_text.empty()) {
             AppendChat("assistant", response.assistant_text);
         }
-        if (response.speak && !response.assistant_text.empty()) {
+        if (app_config_.tts_enabled && response.speak && !response.assistant_text.empty()) {
             tts_.Speak(response.assistant_text);
         }
         if (response.advance_step) {
@@ -3511,6 +3783,8 @@ class MainWindow : public QMainWindow {
         std::string mic_label = "mic: ";
         if (!sidecar_ok_) {
             mic_label += "offline";
+        } else if (!app_config_.speech_enabled) {
+            mic_label += "disabled";
         } else if (!vad_available_) {
             mic_label += "listening (manual stop fallback)";
         } else if (speech_started_recently) {
@@ -3520,7 +3794,7 @@ class MainWindow : public QMainWindow {
         }
         mic_status_->setText(mic_label.c_str());
         tts_status_->setText(std::string("tts: ").append(tts_.IsSpeaking() ? "speaking" : "idle").c_str());
-        std::string gesture_label = "gesture: " + gesture_status_text_;
+        std::string gesture_label = "gesture: " + (app_config_.gesture_enabled ? gesture_status_text_ : "disabled");
         if (gesture_active_) {
             gesture_label += " (active)";
         }
@@ -3547,11 +3821,21 @@ class MainWindow : public QMainWindow {
                                                                    QString::fromStdString(text)));
     }
 
+    Settings RuntimeSettings() const {
+        return Settings{
+            app_config_.speech_enabled,
+            app_config_.vision_enabled,
+            app_config_.gesture_enabled,
+            app_config_.tts_enabled,
+        };
+    }
+
     QTimer poll_timer_;
     QLabel* camera_label_ = nullptr;
     QPlainTextEdit* chat_history_ = nullptr;
     QLineEdit* input_line_ = nullptr;
     QPushButton* planner_settings_btn_ = nullptr;
+    QPushButton* runtime_settings_btn_ = nullptr;
     QCheckBox* dev_toggle_ = nullptr;
     QPlainTextEdit* debug_text_ = nullptr;
     QLabel* mic_status_ = nullptr;
@@ -3587,6 +3871,8 @@ class MainWindow : public QMainWindow {
     std::string app_config_path_;
     DebugSnapshot debug_snapshot_{};
     std::optional<std::chrono::steady_clock::time_point> last_speech_start_at_;
+    std::string sidecar_host_ = "127.0.0.1";
+    int sidecar_port_ = 8080;
     TtsController tts_;
     SidecarSpeechInputAdapter speech_input_{"127.0.0.1", 8080};
     PythonSidecarManager sidecar_manager_{};

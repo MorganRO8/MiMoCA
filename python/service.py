@@ -38,40 +38,111 @@ from mediapipe.tasks.python import vision
 
 HOST = "127.0.0.1"
 PORT = 8080
-DEFAULT_STT_MODEL = os.getenv("MIMOCA_STT_MODEL", "distil-large-v3")
-DEFAULT_STT_DEVICE = os.getenv("MIMOCA_STT_DEVICE", "cpu")
-DEFAULT_STT_COMPUTE_TYPE = os.getenv("MIMOCA_STT_COMPUTE_TYPE", "int8")
-DEFAULT_GESTURE_MODEL_PATH = os.getenv("MIMOCA_GESTURE_MODEL_PATH", "python/models/hand_landmarker.task")
-DEFAULT_GESTURE_MODEL_URL = os.getenv(
-    "MIMOCA_GESTURE_MODEL_URL",
-    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
-).strip()
-DEFAULT_VISION_MODEL = os.getenv("MIMOCA_VISION_MODEL", "yolov8s-worldv2.pt")
-DEFAULT_VISION_CONFIDENCE = float(os.getenv("MIMOCA_VISION_CONFIDENCE", "0.25"))
-DEFAULT_PLANNER_MODE = os.getenv("MIMOCA_PLANNER_MODE", "llm").strip().lower()
-DEFAULT_LLM_PROVIDER = os.getenv("MIMOCA_LLM_PROVIDER", "openai_compatible").strip().lower()
-DEFAULT_LLM_BASE_URL = os.getenv("MIMOCA_LLM_BASE_URL", "https://api.openai.com/v1").strip()
-DEFAULT_LLM_MODEL = os.getenv("MIMOCA_LLM_MODEL", "gpt-4o-mini").strip()
-DEFAULT_LLM_API_KEY = os.getenv("MIMOCA_LLM_API_KEY", "").strip()
-DEFAULT_LLM_TIMEOUT_S = float(os.getenv("MIMOCA_LLM_TIMEOUT_S", "12"))
-DEFAULT_LLM_TEMPERATURE = float(os.getenv("MIMOCA_LLM_TEMPERATURE", "0.2"))
-DEFAULT_LLM_MAX_OUTPUT_CHARS = int(os.getenv("MIMOCA_LLM_MAX_OUTPUT_CHARS", "220"))
+DEFAULT_LLM_MAX_OUTPUT_CHARS = 220
 FIXED_VOCABULARY = ["onion", "knife", "cutting board", "pot", "pan", "bowl", "spoon", "rice cooker"]
-DEFAULT_CACHE_ROOT = os.getenv("MIMOCA_MODEL_CACHE_ROOT", os.path.join("python", "model_cache"))
-DEFAULT_STT_CACHE_ROOT = os.getenv("MIMOCA_STT_CACHE_ROOT", os.path.join(DEFAULT_CACHE_ROOT, "stt"))
-DEFAULT_VISION_CACHE_ROOT = os.getenv("MIMOCA_VISION_CACHE_ROOT", os.path.join(DEFAULT_CACHE_ROOT, "vision"))
-DEFAULT_GESTURE_CACHE_ROOT = os.getenv("MIMOCA_GESTURE_CACHE_ROOT", os.path.join(DEFAULT_CACHE_ROOT, "gesture"))
-DEFAULT_REQUIRED_MODALITIES = {
-    value.strip().lower()
-    for value in os.getenv("MIMOCA_REQUIRED_MODALITIES", "stt,vision").split(",")
-    if value.strip()
-}
-ALLOW_DEGRADED_STARTUP = os.getenv("MIMOCA_ALLOW_DEGRADED_STARTUP", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+DEFAULT_CACHE_ROOT = os.path.join("python", "model_cache")
+DEFAULT_STT_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "stt")
+DEFAULT_VISION_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "vision")
+DEFAULT_GESTURE_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "gesture")
+
+
+@dataclass
+class RuntimeConfig:
+    host: str = "127.0.0.1"
+    port: int = 8080
+    speech_enabled: bool = True
+    vision_enabled: bool = True
+    gesture_enabled: bool = True
+    tts_enabled: bool = True
+    stt_model: str = "distil-large-v3"
+    stt_device: str = "cpu"
+    stt_compute_type: str = "int8"
+    gesture_model_path: str = "python/models/hand_landmarker.task"
+    gesture_model_url: str = (
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+    )
+    vision_model: str = "yolov8s-worldv2.pt"
+    vision_confidence: float = 0.25
+    planner_mode: str = "llm"
+    planner_provider: str = "openai_compatible"
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_model: str = "gpt-4o-mini"
+    llm_api_key: str = ""
+    llm_timeout_s: float = 12.0
+    llm_temperature: float = 0.2
+    cache_root: str = DEFAULT_CACHE_ROOT
+    stt_cache_root: str = DEFAULT_STT_CACHE_ROOT
+    vision_cache_root: str = DEFAULT_VISION_CACHE_ROOT
+    gesture_cache_root: str = DEFAULT_GESTURE_CACHE_ROOT
+    required_modalities: set[str] = field(default_factory=lambda: {"stt", "vision"})
+    allow_degraded_startup: bool = True
+
+
+def _truthy(raw: str, fallback: bool) -> bool:
+    value = (raw or "").strip().lower()
+    if not value:
+        return fallback
+    return value in {"1", "true", "yes", "on"}
+
+
+def _load_runtime_config() -> RuntimeConfig:
+    config = RuntimeConfig()
+    config_path = os.getenv("MIMOCA_APP_CONFIG_PATH", "mimoca_app_config.json")
+    try:
+        payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        payload = {}
+    sidecar = payload.get("sidecar", {})
+    modalities = payload.get("modalities", {})
+    planner = payload.get("planner", {})
+    model_paths = payload.get("model_paths", {})
+
+    config.host = str(sidecar.get("host", config.host)).strip() or config.host
+    try:
+        config.port = int(sidecar.get("port", config.port))
+    except Exception:  # noqa: BLE001
+        pass
+    config.speech_enabled = bool(modalities.get("speech_enabled", config.speech_enabled))
+    config.vision_enabled = bool(modalities.get("vision_enabled", config.vision_enabled))
+    config.gesture_enabled = bool(modalities.get("gesture_enabled", config.gesture_enabled))
+    config.tts_enabled = bool(modalities.get("tts_enabled", config.tts_enabled))
+    config.planner_mode = str(planner.get("mode", config.planner_mode)).strip().lower() or config.planner_mode
+    config.planner_provider = str(planner.get("provider", config.planner_provider)).strip().lower() or config.planner_provider
+    config.llm_base_url = str(planner.get("base_url", config.llm_base_url)).strip() or config.llm_base_url
+    config.llm_model = str(planner.get("model", config.llm_model)).strip() or config.llm_model
+    config.stt_model = str(model_paths.get("stt_model", config.stt_model)).strip() or config.stt_model
+    config.vision_model = str(model_paths.get("vision_model", config.vision_model)).strip() or config.vision_model
+    config.gesture_model_path = (
+        str(model_paths.get("gesture_model_path", config.gesture_model_path)).strip() or config.gesture_model_path
+    )
+
+    config.host = os.getenv("MIMOCA_SIDECAR_HOST", config.host).strip() or config.host
+    config.port = int(os.getenv("MIMOCA_SIDECAR_PORT", str(config.port)))
+    config.stt_model = os.getenv("MIMOCA_STT_MODEL", config.stt_model).strip() or config.stt_model
+    config.stt_device = os.getenv("MIMOCA_STT_DEVICE", config.stt_device).strip() or config.stt_device
+    config.stt_compute_type = os.getenv("MIMOCA_STT_COMPUTE_TYPE", config.stt_compute_type).strip() or config.stt_compute_type
+    config.gesture_model_path = os.getenv("MIMOCA_GESTURE_MODEL_PATH", config.gesture_model_path).strip() or config.gesture_model_path
+    config.gesture_model_url = os.getenv("MIMOCA_GESTURE_MODEL_URL", config.gesture_model_url).strip() or config.gesture_model_url
+    config.vision_model = os.getenv("MIMOCA_VISION_MODEL", config.vision_model).strip() or config.vision_model
+    config.vision_confidence = float(os.getenv("MIMOCA_VISION_CONFIDENCE", str(config.vision_confidence)))
+    config.planner_mode = os.getenv("MIMOCA_PLANNER_MODE", config.planner_mode).strip().lower() or config.planner_mode
+    config.planner_provider = os.getenv("MIMOCA_LLM_PROVIDER", config.planner_provider).strip().lower() or config.planner_provider
+    config.llm_base_url = os.getenv("MIMOCA_LLM_BASE_URL", config.llm_base_url).strip() or config.llm_base_url
+    config.llm_model = os.getenv("MIMOCA_LLM_MODEL", config.llm_model).strip() or config.llm_model
+    config.llm_api_key = os.getenv("MIMOCA_LLM_API_KEY", "").strip()
+    config.llm_timeout_s = float(os.getenv("MIMOCA_LLM_TIMEOUT_S", str(config.llm_timeout_s)))
+    config.llm_temperature = float(os.getenv("MIMOCA_LLM_TEMPERATURE", str(config.llm_temperature)))
+    config.cache_root = os.getenv("MIMOCA_MODEL_CACHE_ROOT", config.cache_root)
+    config.stt_cache_root = os.getenv("MIMOCA_STT_CACHE_ROOT", os.path.join(config.cache_root, "stt"))
+    config.vision_cache_root = os.getenv("MIMOCA_VISION_CACHE_ROOT", os.path.join(config.cache_root, "vision"))
+    config.gesture_cache_root = os.getenv("MIMOCA_GESTURE_CACHE_ROOT", os.path.join(config.cache_root, "gesture"))
+    required_raw = os.getenv("MIMOCA_REQUIRED_MODALITIES", ",".join(sorted(config.required_modalities)))
+    config.required_modalities = {item.strip().lower() for item in required_raw.split(",") if item.strip()}
+    config.allow_degraded_startup = _truthy(os.getenv("MIMOCA_ALLOW_DEGRADED_STARTUP", "true"), True)
+    return config
+
+
+CONFIG = _load_runtime_config()
 
 
 @dataclass
@@ -109,9 +180,9 @@ class FasterWhisperSpeechAdapter:
     """Small adapter boundary around faster-whisper."""
 
     def __init__(self) -> None:
-        self.model_name = DEFAULT_STT_MODEL
-        self.device = DEFAULT_STT_DEVICE
-        self.compute_type = DEFAULT_STT_COMPUTE_TYPE
+        self.model_name = CONFIG.stt_model
+        self.device = CONFIG.stt_device
+        self.compute_type = CONFIG.stt_compute_type
         self.model: WhisperModel | None = None
         self.load_failure: str = ""
         self.sessions: dict[str, BufferedAudioSession] = {}
@@ -121,7 +192,7 @@ class FasterWhisperSpeechAdapter:
         self.vad_min_rms = float(os.getenv("MIMOCA_VAD_MIN_RMS", "0.008"))
         self.vad_noise_multiplier = float(os.getenv("MIMOCA_VAD_NOISE_MULTIPLIER", "2.8"))
         self.vad_history = deque(maxlen=64)
-        self.cache_root = DEFAULT_STT_CACHE_ROOT
+        self.cache_root = CONFIG.stt_cache_root
 
     def _load_model_with_fallback(self) -> WhisperModel:
         candidates = [self.model_name]
@@ -403,8 +474,8 @@ class MediaPipeGestureAdapter:
     SUPPORTED_LABELS = {"next", "repeat", "option_a", "option_b", "none"}
 
     def __init__(self) -> None:
-        self.model_path = DEFAULT_GESTURE_MODEL_PATH
-        self.model_url = DEFAULT_GESTURE_MODEL_URL
+        self.model_path = CONFIG.gesture_model_path
+        self.model_url = CONFIG.gesture_model_url
         self.failure_reason = ""
         self.landmarker: vision.HandLandmarker | None = None
         self._resolved_model_path = self.model_path
@@ -440,7 +511,7 @@ class MediaPipeGestureAdapter:
 
         if not self.model_url:
             raise RuntimeError("gesture_model_url_missing")
-        cache_target = Path(DEFAULT_GESTURE_CACHE_ROOT) / configured_path.name
+        cache_target = Path(CONFIG.gesture_cache_root) / configured_path.name
         cache_target.parent.mkdir(parents=True, exist_ok=True)
         self._download_file_with_progress(self.model_url, cache_target, progress_callback)
         if not configured_path.exists():
@@ -576,12 +647,12 @@ class YoloVisionAdapter:
     """Ultralytics YOLO adapter with a tiny fixed cooking vocabulary."""
 
     def __init__(self) -> None:
-        self.model_name = DEFAULT_VISION_MODEL
-        self.confidence = DEFAULT_VISION_CONFIDENCE
+        self.model_name = CONFIG.vision_model
+        self.confidence = CONFIG.vision_confidence
         self.vocabulary = list(FIXED_VOCABULARY)
         self.model: YOLO | None = None
         self.failure_reason = ""
-        self.cache_root = DEFAULT_VISION_CACHE_ROOT
+        self.cache_root = CONFIG.vision_cache_root
 
     def _init_model(self) -> None:
         try:
@@ -657,8 +728,8 @@ class StartupReadinessManager:
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.updated_at = self.started_at
         self.message = "starting"
-        self.required_modalities = set(DEFAULT_REQUIRED_MODALITIES)
-        self.allow_degraded = ALLOW_DEGRADED_STARTUP
+        self.required_modalities = set(CONFIG.required_modalities)
+        self.allow_degraded = CONFIG.allow_degraded_startup
         self.modalities: dict[str, ModalityReadiness] = {
             "stt": ModalityReadiness(),
             "vision": ModalityReadiness(),
@@ -674,7 +745,7 @@ class StartupReadinessManager:
             self.updated_at = datetime.now(timezone.utc).isoformat()
 
     def _run(self) -> None:
-        os.makedirs(DEFAULT_CACHE_ROOT, exist_ok=True)
+        os.makedirs(CONFIG.cache_root, exist_ok=True)
         self._initialize_stt()
         self._initialize_vision()
         self._initialize_gesture()
@@ -759,10 +830,10 @@ class StartupReadinessManager:
                 "started_at": self.started_at,
                 "updated_at": self.updated_at,
                 "cache_paths": {
-                    "root": DEFAULT_CACHE_ROOT,
-                    "stt": DEFAULT_STT_CACHE_ROOT,
-                    "vision": DEFAULT_VISION_CACHE_ROOT,
-                    "gesture": DEFAULT_GESTURE_CACHE_ROOT,
+                    "root": CONFIG.cache_root,
+                    "stt": CONFIG.stt_cache_root,
+                    "vision": CONFIG.vision_cache_root,
+                    "gesture": CONFIG.gesture_cache_root,
                 },
             }
 
@@ -799,13 +870,13 @@ class LlmPlannerAdapter:
     """Provider-agnostic planner boundary with openai-compatible HTTP support."""
 
     def __init__(self) -> None:
-        self.mode = DEFAULT_PLANNER_MODE if DEFAULT_PLANNER_MODE in {"mock", "llm"} else "llm"
-        self.provider = DEFAULT_LLM_PROVIDER
-        self.base_url = DEFAULT_LLM_BASE_URL.rstrip("/")
-        self.model = DEFAULT_LLM_MODEL
-        self.api_key = DEFAULT_LLM_API_KEY
-        self.timeout_s = DEFAULT_LLM_TIMEOUT_S
-        self.temperature = DEFAULT_LLM_TEMPERATURE
+        self.mode = CONFIG.planner_mode if CONFIG.planner_mode in {"mock", "llm"} else "llm"
+        self.provider = CONFIG.planner_provider
+        self.base_url = CONFIG.llm_base_url.rstrip("/")
+        self.model = CONFIG.llm_model
+        self.api_key = CONFIG.llm_api_key
+        self.timeout_s = CONFIG.llm_timeout_s
+        self.temperature = CONFIG.llm_temperature
 
     @property
     def llm_configured(self) -> bool:
@@ -830,8 +901,8 @@ class LlmPlannerAdapter:
 
         self.mode = mode
         self.provider = provider
-        self.base_url = base_url or DEFAULT_LLM_BASE_URL.rstrip("/")
-        self.model = model or DEFAULT_LLM_MODEL
+        self.base_url = base_url or CONFIG.llm_base_url.rstrip("/")
+        self.model = model or CONFIG.llm_model
         self.api_key = api_key
         return {
             "mode": self.mode,
@@ -1304,9 +1375,28 @@ def main() -> None:
         level=logging.INFO,
         format="[python-sidecar] %(asctime)s %(levelname)s %(message)s",
     )
+    logging.info(
+        "effective config: host=%s port=%d planner_mode=%s planner_provider=%s llm_base_url=%s llm_model=%s "
+        "modalities[speech=%s vision=%s gesture=%s tts=%s] model_paths[stt=%s vision=%s gesture=%s] "
+        "secrets[llm_api_key=%s]",
+        CONFIG.host,
+        CONFIG.port,
+        CONFIG.planner_mode,
+        CONFIG.planner_provider,
+        CONFIG.llm_base_url,
+        CONFIG.llm_model,
+        CONFIG.speech_enabled,
+        CONFIG.vision_enabled,
+        CONFIG.gesture_enabled,
+        CONFIG.tts_enabled,
+        CONFIG.stt_model,
+        CONFIG.vision_model,
+        CONFIG.gesture_model_path,
+        "redacted" if CONFIG.llm_api_key else "not_set",
+    )
     STARTUP_MANAGER.ensure_started()
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    logging.info("service listening on http://%s:%d", HOST, PORT)
+    server = ThreadingHTTPServer((CONFIG.host, CONFIG.port), Handler)
+    logging.info("service listening on http://%s:%d", CONFIG.host, CONFIG.port)
     server.serve_forever()
 
 
