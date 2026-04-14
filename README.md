@@ -48,7 +48,7 @@ cmake --build build
 On installer-first-run and normal first app run, MiMoCA now bootstraps a local sidecar virtual environment automatically:
 - creates `.mimoca_sidecar_venv`
 - installs `python/requirements.txt`
-- persists the environment location in `mimoca_app_config.json` (`sidecar_env_path`)
+- persists app defaults in `mimoca_app_config.json` (`sidecar_env_path`, `planner_mode`)
 - launches `python/service.py` with that exact venv interpreter
 
 You can also run the same bootstrap tool manually (for installer integration or repair flows):
@@ -238,13 +238,19 @@ Expected: deterministic mock `PlannerResponse` JSON payload that can request ste
 
 ## Real LLM planner mode
 
-By default, planner mode remains mock:
+By default, planner mode is `llm` (production default):
+
+```bash
+python3 python/service.py
+```
+
+For explicit local mock mode (development/testing only):
 
 ```bash
 MIMOCA_PLANNER_MODE=mock python3 python/service.py
 ```
 
-Enable real LLM planning (OpenAI-compatible HTTP API):
+Enable/configure LLM planning (OpenAI-compatible HTTP API):
 
 ```bash
 MIMOCA_PLANNER_MODE=llm \
@@ -260,4 +266,9 @@ Optional planner controls:
 - `MIMOCA_LLM_TEMPERATURE` (default `0.2`)
 - `MIMOCA_LLM_MAX_OUTPUT_CHARS` (default `220`)
 
-The `/health` payload reports `planner_mode`, `planner_provider`, and `planner_llm_ready`.
+The `/health` payload reports planner state flags:
+- `planner_mode`
+- `planner_provider`
+- `planner_llm_configured`
+- `planner_llm_ready`
+- `planner_fallback_active`
