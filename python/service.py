@@ -48,7 +48,7 @@ DEFAULT_GESTURE_MODEL_URL = os.getenv(
 ).strip()
 DEFAULT_VISION_MODEL = os.getenv("MIMOCA_VISION_MODEL", "yolov8s-worldv2.pt")
 DEFAULT_VISION_CONFIDENCE = float(os.getenv("MIMOCA_VISION_CONFIDENCE", "0.25"))
-DEFAULT_PLANNER_MODE = os.getenv("MIMOCA_PLANNER_MODE", "mock").strip().lower()
+DEFAULT_PLANNER_MODE = os.getenv("MIMOCA_PLANNER_MODE", "llm").strip().lower()
 DEFAULT_LLM_PROVIDER = os.getenv("MIMOCA_LLM_PROVIDER", "openai_compatible").strip().lower()
 DEFAULT_LLM_BASE_URL = os.getenv("MIMOCA_LLM_BASE_URL", "https://api.openai.com/v1").strip()
 DEFAULT_LLM_MODEL = os.getenv("MIMOCA_LLM_MODEL", "gpt-4o-mini").strip()
@@ -798,7 +798,7 @@ class LlmPlannerAdapter:
     """Provider-agnostic planner boundary with openai-compatible HTTP support."""
 
     def __init__(self) -> None:
-        self.mode = DEFAULT_PLANNER_MODE if DEFAULT_PLANNER_MODE in {"mock", "llm"} else "mock"
+        self.mode = DEFAULT_PLANNER_MODE if DEFAULT_PLANNER_MODE in {"mock", "llm"} else "llm"
         self.provider = DEFAULT_LLM_PROVIDER
         self.base_url = DEFAULT_LLM_BASE_URL.rstrip("/")
         self.model = DEFAULT_LLM_MODEL
@@ -807,10 +807,14 @@ class LlmPlannerAdapter:
         self.temperature = DEFAULT_LLM_TEMPERATURE
 
     @property
+    def llm_configured(self) -> bool:
+        return bool(self.api_key) and bool(self.model) and self.provider == "openai_compatible"
+
+    @property
     def llm_ready(self) -> bool:
         if self.mode != "llm":
             return False
-        return bool(self.api_key) and bool(self.model) and self.provider == "openai_compatible"
+        return self.llm_configured
 
     def update_config(self, payload: dict) -> dict:
         mode = str(payload.get("mode", self.mode)).strip().lower()
@@ -833,6 +837,7 @@ class LlmPlannerAdapter:
             "provider": self.provider,
             "base_url": self.base_url,
             "model": self.model,
+            "llm_configured": self.llm_configured,
             "llm_ready": self.llm_ready,
         }
 
@@ -1006,6 +1011,25 @@ class LlmPlannerAdapter:
 
 
 PLANNER_ADAPTER = LlmPlannerAdapter()
+PLANNER_RUNTIME_STATUS = {
+    "fallback_active": False,
+    "last_error": "",
+    "lock": threading.Lock(),
+}
+
+
+def _set_planner_fallback_state(active: bool, error_text: str = "") -> None:
+    with PLANNER_RUNTIME_STATUS["lock"]:
+        PLANNER_RUNTIME_STATUS["fallback_active"] = active
+        PLANNER_RUNTIME_STATUS["last_error"] = (error_text or "")[:220]
+
+
+def _planner_runtime_snapshot() -> dict:
+    with PLANNER_RUNTIME_STATUS["lock"]:
+        return {
+            "fallback_active": bool(PLANNER_RUNTIME_STATUS["fallback_active"]),
+            "last_error": str(PLANNER_RUNTIME_STATUS["last_error"]),
+        }
 
 
 def _deterministic_mock_planner(turn_context: dict) -> dict:
@@ -1121,16 +1145,19 @@ def _deterministic_mock_planner(turn_context: dict) -> dict:
 
 def _planner_with_fallback(turn_context: dict) -> dict:
     if PLANNER_ADAPTER.mode != "llm":
+        _set_planner_fallback_state(False)
         return _deterministic_mock_planner(turn_context)
     try:
         response = PLANNER_ADAPTER.plan(turn_context)
         logging.info("planner llm structured response: %s", json.dumps(response, separators=(",", ":")))
+        _set_planner_fallback_state(False)
         return response
     except Exception as exc:  # noqa: BLE001
         logging.warning("planner llm failed, falling back to mock planner: %s", exc)
+        _set_planner_fallback_state(True, str(exc))
         fallback = _deterministic_mock_planner(turn_context)
         fallback["assistant_text"] = _constrain_assistant_text(
-            f"Planner fallback active. {fallback.get('assistant_text', '')}"
+            f"I could not verify the planner response, so I am using a conservative fallback. {fallback.get('assistant_text', '')}"
         )
         fallback.setdefault("ui_overlays", []).append({"type": "planner_fallback", "target": "mock"})
         return fallback
@@ -1156,6 +1183,7 @@ class Handler(BaseHTTPRequestHandler):
             startup_state = readiness.get("state", "downloading")
             ready_for_app = startup_state in {"ready", "degraded"}
             status_code = 200 if ready_for_app else 503
+            planner_runtime = _planner_runtime_snapshot()
             self._write_json(
                 status_code,
                 {
@@ -1175,7 +1203,10 @@ class Handler(BaseHTTPRequestHandler):
                     "vision_vocabulary": VISION_ADAPTER.vocabulary,
                     "planner_mode": PLANNER_ADAPTER.mode,
                     "planner_provider": PLANNER_ADAPTER.provider,
+                    "planner_llm_configured": PLANNER_ADAPTER.llm_configured,
                     "planner_llm_ready": PLANNER_ADAPTER.llm_ready,
+                    "planner_fallback_active": planner_runtime.get("fallback_active", False),
+                    "planner_fallback_error": planner_runtime.get("last_error", ""),
                 },
             )
             return

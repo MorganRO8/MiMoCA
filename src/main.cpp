@@ -227,6 +227,7 @@ struct RuntimeIntent {
 
 struct AppConfig {
     std::string sidecar_env_path;
+    std::string planner_mode = "llm";
 };
 
 struct SidecarBootstrapResult {
@@ -785,6 +786,10 @@ AppConfig LoadAppConfig(const std::string& path) {
         return config;
     }
     config.sidecar_env_path = Trim(ExtractJsonFieldString(json, "sidecar_env_path"));
+    config.planner_mode = ToLower(Trim(ExtractJsonFieldString(json, "planner_mode")));
+    if (config.planner_mode != "llm" && config.planner_mode != "mock") {
+        config.planner_mode = "llm";
+    }
     return config;
 }
 
@@ -795,7 +800,8 @@ bool SaveAppConfig(const std::string& path, const AppConfig& config) {
         return false;
     }
     output << "{\n";
-    output << "  \"sidecar_env_path\": \"" << EscapeJson(config.sidecar_env_path) << "\"\n";
+    output << "  \"sidecar_env_path\": \"" << EscapeJson(config.sidecar_env_path) << "\",\n";
+    output << "  \"planner_mode\": \"" << EscapeJson(config.planner_mode) << "\"\n";
     output << "}\n";
     return true;
 }
@@ -1176,8 +1182,10 @@ struct SidecarHealthStatus {
     std::string summary;
     double progress = 0.0;
     std::string body;
-    std::string planner_mode = "mock";
+    std::string planner_mode = "llm";
+    bool planner_llm_configured = false;
     bool planner_llm_ready = false;
+    bool planner_fallback_active = false;
 };
 
 SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
@@ -1202,9 +1210,11 @@ SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
     health.body = body;
     health.planner_mode = Trim(ExtractJsonFieldString(body, "planner_mode"));
     if (health.planner_mode.empty()) {
-        health.planner_mode = "mock";
+        health.planner_mode = "llm";
     }
+    health.planner_llm_configured = ExtractJsonFieldBool(body, "planner_llm_configured", false);
     health.planner_llm_ready = ExtractJsonFieldBool(body, "planner_llm_ready", false);
+    health.planner_fallback_active = ExtractJsonFieldBool(body, "planner_fallback_active", false);
     if (health.ready) {
         Log("Python sidecar health check succeeded.");
     } else {
@@ -2723,6 +2733,9 @@ class MainWindow : public QMainWindow {
             return;
         }
         const SidecarHealthStatus health = QueryPythonHealth("127.0.0.1", 8080);
+        planner_mode_ = health.planner_mode;
+        planner_llm_configured_ = health.planner_llm_configured;
+        planner_fallback_active_ = health.planner_fallback_active;
         if (health.planner_mode != "llm" || health.planner_llm_ready) {
             return;
         }
@@ -2956,6 +2969,14 @@ class MainWindow : public QMainWindow {
             statusBar()->showMessage(QString::fromStdString(message), 3000);
             Log(message);
         });
+        if (sidecar_ok_) {
+            const SidecarHealthStatus health = QueryPythonHealth("127.0.0.1", 8080);
+            planner_mode_ = health.planner_mode;
+            planner_llm_configured_ = health.planner_llm_configured;
+            planner_fallback_active_ = health.planner_fallback_active;
+        } else {
+            planner_fallback_active_ = true;
+        }
         if (!sidecar_ok_ && sidecar_manager_.runtime_missing()) {
             sidecar_status_->setText("sidecar: python runtime missing (see log)");
         }
@@ -3060,7 +3081,19 @@ class MainWindow : public QMainWindow {
     void RefreshStatusIndicators() {
         mic_status_->setText(std::string("mic: ").append(mic_active_ ? "active" : "idle").c_str());
         gesture_status_->setText(std::string("gesture: ").append(gesture_active_ ? "active" : "idle").c_str());
-        planner_status_->setText(std::string("planner: ").append(planner_ready_ ? "ready" : "fallback").c_str());
+        std::string planner_label = "planner: ";
+        if (!sidecar_ok_) {
+            planner_label += "offline fallback";
+        } else if (planner_fallback_active_) {
+            planner_label += "fallback active";
+        } else if (planner_mode_ == "llm" && planner_llm_configured_) {
+            planner_label += "llm configured";
+        } else if (planner_mode_ == "llm") {
+            planner_label += "llm needs key";
+        } else {
+            planner_label += planner_ready_ ? "mock ready" : "mock";
+        }
+        planner_status_->setText(planner_label.c_str());
         sidecar_status_->setText(std::string("sidecar: ").append(sidecar_ok_ ? "healthy" : "offline").c_str());
     }
 
@@ -3089,6 +3122,9 @@ class MainWindow : public QMainWindow {
     bool mic_active_ = false;
     bool gesture_active_ = false;
     bool planner_ready_ = false;
+    bool planner_llm_configured_ = false;
+    bool planner_fallback_active_ = false;
+    std::string planner_mode_ = "llm";
 
     RecipeState recipe_state_{};
     AppConfig app_config_{};
