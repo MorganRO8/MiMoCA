@@ -362,6 +362,7 @@ class FasterWhisperSpeechAdapter:
             "is_final": is_final,
             "text": utterance_text,
             "speech_started": bool(vad.get("speech_started", False)),
+            "speech_ended": bool(vad.get("speech_ended", False)),
             "speech_active": bool(vad.get("speech_active", False)),
             "vad_available": bool(vad.get("vad_available", True)),
             "manual_interrupt_only": not bool(vad.get("vad_available", True)),
