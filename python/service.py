@@ -17,12 +17,14 @@ import base64
 import io
 import os
 import re
+import threading
 import uuid
 import wave
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -40,6 +42,10 @@ DEFAULT_STT_MODEL = os.getenv("MIMOCA_STT_MODEL", "distil-large-v3")
 DEFAULT_STT_DEVICE = os.getenv("MIMOCA_STT_DEVICE", "cpu")
 DEFAULT_STT_COMPUTE_TYPE = os.getenv("MIMOCA_STT_COMPUTE_TYPE", "int8")
 DEFAULT_GESTURE_MODEL_PATH = os.getenv("MIMOCA_GESTURE_MODEL_PATH", "python/models/hand_landmarker.task")
+DEFAULT_GESTURE_MODEL_URL = os.getenv(
+    "MIMOCA_GESTURE_MODEL_URL",
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+).strip()
 DEFAULT_VISION_MODEL = os.getenv("MIMOCA_VISION_MODEL", "yolov8s-worldv2.pt")
 DEFAULT_VISION_CONFIDENCE = float(os.getenv("MIMOCA_VISION_CONFIDENCE", "0.25"))
 DEFAULT_PLANNER_MODE = os.getenv("MIMOCA_PLANNER_MODE", "mock").strip().lower()
@@ -51,6 +57,29 @@ DEFAULT_LLM_TIMEOUT_S = float(os.getenv("MIMOCA_LLM_TIMEOUT_S", "12"))
 DEFAULT_LLM_TEMPERATURE = float(os.getenv("MIMOCA_LLM_TEMPERATURE", "0.2"))
 DEFAULT_LLM_MAX_OUTPUT_CHARS = int(os.getenv("MIMOCA_LLM_MAX_OUTPUT_CHARS", "220"))
 FIXED_VOCABULARY = ["onion", "knife", "cutting board", "pot", "pan", "bowl", "spoon", "rice cooker"]
+DEFAULT_CACHE_ROOT = os.getenv("MIMOCA_MODEL_CACHE_ROOT", os.path.join("python", "model_cache"))
+DEFAULT_STT_CACHE_ROOT = os.getenv("MIMOCA_STT_CACHE_ROOT", os.path.join(DEFAULT_CACHE_ROOT, "stt"))
+DEFAULT_VISION_CACHE_ROOT = os.getenv("MIMOCA_VISION_CACHE_ROOT", os.path.join(DEFAULT_CACHE_ROOT, "vision"))
+DEFAULT_GESTURE_CACHE_ROOT = os.getenv("MIMOCA_GESTURE_CACHE_ROOT", os.path.join(DEFAULT_CACHE_ROOT, "gesture"))
+DEFAULT_REQUIRED_MODALITIES = {
+    value.strip().lower()
+    for value in os.getenv("MIMOCA_REQUIRED_MODALITIES", "stt,vision").split(",")
+    if value.strip()
+}
+ALLOW_DEGRADED_STARTUP = os.getenv("MIMOCA_ALLOW_DEGRADED_STARTUP", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+@dataclass
+class ModalityReadiness:
+    status: str = "downloading"
+    progress: float = 0.0
+    message: str = "pending"
+    error: str = ""
 
 
 @dataclass
@@ -92,6 +121,7 @@ class FasterWhisperSpeechAdapter:
         self.vad_min_rms = float(os.getenv("MIMOCA_VAD_MIN_RMS", "0.008"))
         self.vad_noise_multiplier = float(os.getenv("MIMOCA_VAD_NOISE_MULTIPLIER", "2.8"))
         self.vad_history = deque(maxlen=64)
+        self.cache_root = DEFAULT_STT_CACHE_ROOT
 
     def _load_model_with_fallback(self) -> WhisperModel:
         candidates = [self.model_name]
@@ -100,7 +130,12 @@ class FasterWhisperSpeechAdapter:
         last_error: Exception | None = None
         for candidate in candidates:
             try:
-                model = WhisperModel(candidate, device=self.device, compute_type=self.compute_type)
+                model = WhisperModel(
+                    candidate,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    download_root=self.cache_root,
+                )
                 self.model_name = candidate
                 logging.info("STT model loaded: %s (device=%s, compute_type=%s)", candidate, self.device, self.compute_type)
                 return model
@@ -368,29 +403,65 @@ class MediaPipeGestureAdapter:
 
     def __init__(self) -> None:
         self.model_path = DEFAULT_GESTURE_MODEL_PATH
+        self.model_url = DEFAULT_GESTURE_MODEL_URL
         self.failure_reason = ""
         self.landmarker: vision.HandLandmarker | None = None
-        self._init_landmarker()
+        self._resolved_model_path = self.model_path
 
     def _init_landmarker(self) -> None:
-        if not os.path.exists(self.model_path):
+        if not os.path.exists(self._resolved_model_path):
             self.failure_reason = "hand_landmarker_model_missing"
-            logging.warning("Gesture adapter disabled: model not found at %s", self.model_path)
+            logging.warning("Gesture adapter disabled: model not found at %s", self._resolved_model_path)
             return
         try:
             options = vision.HandLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=self.model_path),
+                base_options=mp_python.BaseOptions(model_asset_path=self._resolved_model_path),
                 num_hands=1,
                 min_hand_detection_confidence=0.4,
                 min_hand_presence_confidence=0.4,
                 min_tracking_confidence=0.4,
             )
             self.landmarker = vision.HandLandmarker.create_from_options(options)
-            logging.info("Gesture adapter ready with MediaPipe model: %s", self.model_path)
+            logging.info("Gesture adapter ready with MediaPipe model: %s", self._resolved_model_path)
         except Exception as exc:  # noqa: BLE001
             self.failure_reason = "hand_landmarker_init_failed"
             self.landmarker = None
             logging.warning("Gesture adapter failed to initialize: %s", exc)
+
+    def ensure_model(self, progress_callback=None) -> None:
+        configured_path = Path(self.model_path)
+        configured_path.parent.mkdir(parents=True, exist_ok=True)
+        if configured_path.exists():
+            self._resolved_model_path = str(configured_path)
+            if progress_callback:
+                progress_callback(1.0, f"using local model at {configured_path}")
+            return
+
+        if not self.model_url:
+            raise RuntimeError("gesture_model_url_missing")
+        cache_target = Path(DEFAULT_GESTURE_CACHE_ROOT) / configured_path.name
+        cache_target.parent.mkdir(parents=True, exist_ok=True)
+        self._download_file_with_progress(self.model_url, cache_target, progress_callback)
+        if not configured_path.exists():
+            configured_path.write_bytes(cache_target.read_bytes())
+        self._resolved_model_path = str(configured_path)
+
+    @staticmethod
+    def _download_file_with_progress(url: str, destination: Path, progress_callback=None) -> None:
+        with urllib_request.urlopen(url, timeout=60) as response:
+            total = int(response.headers.get("Content-Length", "0") or "0")
+            read = 0
+            with destination.open("wb") as out:
+                while True:
+                    chunk = response.read(1024 * 256)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    read += len(chunk)
+                    if progress_callback and total > 0:
+                        progress_callback(min(1.0, read / total), f"downloaded {read}/{total} bytes")
+        if progress_callback:
+            progress_callback(1.0, f"downloaded {destination}")
 
     @staticmethod
     def _decode_image(payload: dict) -> np.ndarray:
@@ -509,10 +580,11 @@ class YoloVisionAdapter:
         self.vocabulary = list(FIXED_VOCABULARY)
         self.model: YOLO | None = None
         self.failure_reason = ""
-        self._init_model()
+        self.cache_root = DEFAULT_VISION_CACHE_ROOT
 
     def _init_model(self) -> None:
         try:
+            os.environ["ULTRALYTICS_HOME"] = self.cache_root
             self.model = YOLO(self.model_name)
             if "world" in self.model_name.lower():
                 self.model.set_classes(self.vocabulary)
@@ -575,6 +647,126 @@ class YoloVisionAdapter:
 
 
 VISION_ADAPTER = YoloVisionAdapter()
+
+
+class StartupReadinessManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.state = "downloading"
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.updated_at = self.started_at
+        self.message = "starting"
+        self.required_modalities = set(DEFAULT_REQUIRED_MODALITIES)
+        self.allow_degraded = ALLOW_DEGRADED_STARTUP
+        self.modalities: dict[str, ModalityReadiness] = {
+            "stt": ModalityReadiness(),
+            "vision": ModalityReadiness(),
+            "gesture": ModalityReadiness(),
+        }
+        self._thread: threading.Thread | None = None
+
+    def _set_modality(self, name: str, **kwargs) -> None:
+        with self._lock:
+            current = self.modalities[name]
+            for key, value in kwargs.items():
+                setattr(current, key, value)
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def _run(self) -> None:
+        os.makedirs(DEFAULT_CACHE_ROOT, exist_ok=True)
+        self._initialize_stt()
+        self._initialize_vision()
+        self._initialize_gesture()
+        self._finalize_state()
+
+    def _initialize_stt(self) -> None:
+        self._set_modality("stt", status="downloading", progress=0.05, message="initializing")
+        try:
+            SPEECH_ADAPTER._ensure_model_loaded()
+            self._set_modality("stt", status="ready", progress=1.0, message="ready", error="")
+        except Exception as exc:  # noqa: BLE001
+            self._set_modality("stt", status="failed", progress=1.0, message="failed", error=str(exc))
+
+    def _initialize_vision(self) -> None:
+        self._set_modality("vision", status="downloading", progress=0.05, message="initializing")
+        try:
+            VISION_ADAPTER._init_model()
+            if VISION_ADAPTER.model is None:
+                raise RuntimeError(VISION_ADAPTER.failure_reason or "vision_unavailable")
+            self._set_modality("vision", status="ready", progress=1.0, message="ready", error="")
+        except Exception as exc:  # noqa: BLE001
+            self._set_modality("vision", status="failed", progress=1.0, message="failed", error=str(exc))
+
+    def _initialize_gesture(self) -> None:
+        self._set_modality("gesture", status="downloading", progress=0.05, message="ensuring hand model")
+        try:
+            GESTURE_ADAPTER.ensure_model(progress_callback=lambda p, m: self._set_modality("gesture", progress=p, message=m))
+            GESTURE_ADAPTER._init_landmarker()
+            if GESTURE_ADAPTER.landmarker is None:
+                raise RuntimeError(GESTURE_ADAPTER.failure_reason or "gesture_unavailable")
+            self._set_modality("gesture", status="ready", progress=1.0, message="ready", error="")
+        except Exception as exc:  # noqa: BLE001
+            self._set_modality("gesture", status="failed", progress=1.0, message="failed", error=str(exc))
+
+    def _finalize_state(self) -> None:
+        with self._lock:
+            required_failures = [
+                name
+                for name, status in self.modalities.items()
+                if name in self.required_modalities and status.status != "ready"
+            ]
+            if required_failures and not self.allow_degraded:
+                self.state = "failed"
+                self.message = f"required modality init failed: {','.join(required_failures)}"
+            elif required_failures and self.allow_degraded:
+                self.state = "degraded"
+                self.message = f"degraded startup: {','.join(required_failures)} unavailable"
+            else:
+                self.state = "ready"
+                self.message = "all required modalities ready"
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def ensure_started(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            if self.state in {"ready", "degraded", "failed"}:
+                return
+            self._thread = threading.Thread(target=self._run, name="mimoca-startup-init", daemon=True)
+            self._thread.start()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            avg_progress = 0.0
+            if self.modalities:
+                avg_progress = sum(item.progress for item in self.modalities.values()) / len(self.modalities)
+            return {
+                "state": self.state,
+                "message": self.message,
+                "progress": max(0.0, min(1.0, avg_progress)),
+                "required_modalities": sorted(self.required_modalities),
+                "allow_degraded_startup": self.allow_degraded,
+                "modalities": {
+                    name: {
+                        "status": modality.status,
+                        "progress": modality.progress,
+                        "message": modality.message,
+                        "error": modality.error,
+                    }
+                    for name, modality in self.modalities.items()
+                },
+                "started_at": self.started_at,
+                "updated_at": self.updated_at,
+                "cache_paths": {
+                    "root": DEFAULT_CACHE_ROOT,
+                    "stt": DEFAULT_STT_CACHE_ROOT,
+                    "vision": DEFAULT_VISION_CACHE_ROOT,
+                    "gesture": DEFAULT_GESTURE_CACHE_ROOT,
+                },
+            }
+
+
+STARTUP_MANAGER = StartupReadinessManager()
 
 
 def _constrain_assistant_text(text: str) -> str:
@@ -895,12 +1087,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         logging.info("request GET %s", self.path)
         if self.path == "/health":
+            STARTUP_MANAGER.ensure_started()
+            readiness = STARTUP_MANAGER.snapshot()
+            startup_state = readiness.get("state", "downloading")
+            ready_for_app = startup_state in {"ready", "degraded"}
+            status_code = 200 if ready_for_app else 503
             self._write_json(
-                200,
+                status_code,
                 {
-                    "status": "ok",
+                    "status": "ok" if ready_for_app else "initializing",
                     "service": "mimoca-python-sidecar",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "startup": readiness,
+                    "startup_ready": ready_for_app,
+                    "startup_summary": readiness.get("message", ""),
                     "stt_model": SPEECH_ADAPTER.model_name,
                     "stt_device": SPEECH_ADAPTER.device,
                     "stt_compute_type": SPEECH_ADAPTER.compute_type,
@@ -987,6 +1187,7 @@ def main() -> None:
         level=logging.INFO,
         format="[python-sidecar] %(asctime)s %(levelname)s %(message)s",
     )
+    STARTUP_MANAGER.ensure_started()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     logging.info("service listening on http://%s:%d", HOST, PORT)
     server.serve_forever()
