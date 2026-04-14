@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(MiMoCA LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 add_executable(mimoca src/main.cpp)
 target_compile_features(mimoca PRIVATE cxx_std_20)
 
@@ -31,4 +33,16 @@ if(MSVC)
   target_link_libraries(mimoca PRIVATE sapi ole32)
 else()
   target_compile_options(mimoca PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+set(MIMOCA_RELEASE_LAYOUT_ROOT "MiMoCA")
+set(MIMOCA_MANAGED_PYTHON_RUNTIME "" CACHE PATH "Path to a managed Python runtime to package under runtime/python")
+
+install(TARGETS mimoca RUNTIME DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/bin)
+install(DIRECTORY assets/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/assets)
+install(DIRECTORY python/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/python)
+install(DIRECTORY scripts/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/scripts)
+
+if(MIMOCA_MANAGED_PYTHON_RUNTIME)
+  install(DIRECTORY "${MIMOCA_MANAGED_PYTHON_RUNTIME}/" DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/runtime/python)
 endif()
