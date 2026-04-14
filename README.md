@@ -82,7 +82,16 @@ MIMOCA_GESTURE_MODEL_PATH=/full/path/to/hand_landmarker.task python3 python/serv
 ./build/mimoca
 ```
 
-On startup, the app loads the sample recipe and then accepts these commands:
+On Windows builds with Qt6 available, startup opens the primary UI directly:
+- large camera preview area
+- right-side transcript/chat history
+- status indicators for mic, gesture, planner, and sidecar health
+- developer-only debug toggle panel
+
+Manual debug/console commands are no longer required for primary operation in that mode.
+On non-Qt builds, the executable prints a fallback message and exits.
+
+Legacy command list (for older non-UI shell flow):
 - `current` → ask planner for current step
 - `next` → ask planner for next instruction (and advance if available)
 - `gesture` → run a gesture-only planner turn using the latest camera frame and sidecar gesture detection

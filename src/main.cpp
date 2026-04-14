@@ -16,6 +16,22 @@
 #include <cctype>
 #include <vector>
 
+#ifdef MIMOCA_HAS_QT
+#include <QApplication>
+#include <QCheckBox>
+#include <QDateTime>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMainWindow>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QStatusBar>
+#include <QTimer>
+#include <QVBoxLayout>
+#include <QWidget>
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -39,6 +55,7 @@
 #ifdef MIMOCA_HAS_OPENCV
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 #endif
 
@@ -1923,6 +1940,26 @@ class CameraController {
 #endif
     }
 
+    bool TryGetLatestFrameBgrCopy(
+#ifdef MIMOCA_HAS_OPENCV
+        cv::Mat& out_frame
+#else
+        std::vector<uint8_t>& out_frame
+#endif
+    ) const {
+#ifdef MIMOCA_HAS_OPENCV
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (latest_frame_.empty()) {
+            return false;
+        }
+        out_frame = latest_frame_.clone();
+        return true;
+#else
+        (void)out_frame;
+        return false;
+#endif
+    }
+
    private:
 #ifdef MIMOCA_HAS_OPENCV
     void CaptureLoop() {
@@ -1978,258 +2015,308 @@ class CameraController {
 
 }  // namespace
 
+
+#ifdef MIMOCA_HAS_QT
+class MainWindow : public QMainWindow {
+   public:
+    MainWindow() {
+        setWindowTitle("MiMoCA");
+        resize(1280, 760);
+
+        sidecar_ok_ = CheckPythonHealth("127.0.0.1", 8080);
+        if (!LoadFirstRecipe("assets/recipes.json", recipe_state_.recipe)) {
+            Log("Failed to load startup recipe; exiting.");
+            startup_failed_ = true;
+            return;
+        }
+        recipe_state_.current_step_index = 0;
+
+        const std::string debug_env = ToLower(Trim(EnvOrDefault("MIMOCA_DEBUG", "0")));
+        debug_mode_enabled_ = debug_env == "1" || debug_env == "true" || debug_env == "on";
+
+        SetupUi();
+        camera_.Start(0);
+        RefreshStatusIndicators();
+
+        poll_timer_.setInterval(120);
+        connect(&poll_timer_, &QTimer::timeout, this, [this]() { OnPollTick(); });
+        poll_timer_.start();
+
+        startup_prompt_pending_ = true;
+        AppendChat("system", "UI ready. Ask 'what next?' by voice or type below.");
+    }
+
+    bool StartupFailed() const { return startup_failed_; }
+
+   private:
+    void SetupUi() {
+        auto* central = new QWidget(this);
+        auto* root = new QHBoxLayout(central);
+        root->setContentsMargins(10, 10, 10, 10);
+
+        auto* left = new QVBoxLayout();
+        camera_label_ = new QLabel("Camera preview unavailable", this);
+        camera_label_->setMinimumSize(880, 640);
+        camera_label_->setStyleSheet("QLabel { background: #111; color: #aaa; border: 1px solid #333; }");
+        camera_label_->setAlignment(Qt::AlignCenter);
+        left->addWidget(camera_label_, 1);
+
+        auto* right = new QVBoxLayout();
+        right->setSpacing(8);
+        right->setContentsMargins(0, 0, 0, 0);
+
+        chat_history_ = new QPlainTextEdit(this);
+        chat_history_->setReadOnly(true);
+        chat_history_->setMinimumWidth(320);
+        chat_history_->setMaximumWidth(380);
+        right->addWidget(chat_history_, 1);
+
+        auto* input_row = new QHBoxLayout();
+        input_line_ = new QLineEdit(this);
+        input_line_->setPlaceholderText("Type a question (developer/manual input)");
+        auto* send_btn = new QPushButton("Send", this);
+        input_row->addWidget(input_line_, 1);
+        input_row->addWidget(send_btn);
+        right->addLayout(input_row);
+
+        dev_toggle_ = new QCheckBox("Developer debug", this);
+        dev_toggle_->setChecked(debug_mode_enabled_);
+        right->addWidget(dev_toggle_);
+
+        debug_text_ = new QPlainTextEdit(this);
+        debug_text_->setReadOnly(true);
+        debug_text_->setMaximumHeight(130);
+        debug_text_->setVisible(debug_mode_enabled_);
+        right->addWidget(debug_text_);
+
+        root->addLayout(left, 4);
+        root->addLayout(right, 1);
+        setCentralWidget(central);
+
+        mic_status_ = new QLabel("mic: idle", this);
+        gesture_status_ = new QLabel("gesture: idle", this);
+        planner_status_ = new QLabel("planner: unknown", this);
+        sidecar_status_ = new QLabel(sidecar_ok_ ? "sidecar: healthy" : "sidecar: unavailable", this);
+        statusBar()->addPermanentWidget(mic_status_);
+        statusBar()->addPermanentWidget(gesture_status_);
+        statusBar()->addPermanentWidget(planner_status_);
+        statusBar()->addPermanentWidget(sidecar_status_);
+
+        connect(send_btn, &QPushButton::clicked, this, [this]() { SubmitManualUtterance(); });
+        connect(input_line_, &QLineEdit::returnPressed, this, [this]() { SubmitManualUtterance(); });
+        connect(dev_toggle_, &QCheckBox::toggled, this, [this](const bool checked) {
+            debug_mode_enabled_ = checked;
+            debug_text_->setVisible(checked);
+            RefreshStatusIndicators();
+        });
+    }
+
+    void SubmitManualUtterance() {
+        const std::string utterance = Trim(input_line_->text().toStdString());
+        if (utterance.empty()) {
+            return;
+        }
+        input_line_->clear();
+        RuntimeIntent intent{};
+        intent.type = IntentFromUtterance(utterance);
+        intent.utterance = utterance;
+        intent.command = utterance;
+        intent.source = "ui_text";
+        AppendChat("user", utterance);
+        ProcessTurn(intent);
+    }
+
+    void OnPollTick() {
+        UpdateCameraPreview();
+
+        if (startup_prompt_pending_) {
+            startup_prompt_pending_ = false;
+            RuntimeIntent intent{};
+            intent.type = IntentType::kStartupReady;
+            intent.command = "ready";
+            intent.source = "internal";
+            ProcessTurn(intent);
+            return;
+        }
+
+        TranscriptEvent transcript_event{};
+        if (sidecar_ok_ && speech_input_.TryConsumeLiveMicrophoneFinalizedEvent(tts_, transcript_event) &&
+            !transcript_event.text.empty()) {
+            RuntimeIntent intent{};
+            intent.type = IntentFromUtterance(transcript_event.text);
+            intent.utterance = transcript_event.text;
+            intent.command = transcript_event.text;
+            intent.source = "speech_live_mic";
+            AppendChat("user", transcript_event.text);
+            ProcessTurn(intent);
+            mic_active_ = true;
+        } else {
+            mic_active_ = false;
+        }
+
+        if (sidecar_ok_) {
+            std::vector<uint8_t> latest_frame_jpeg;
+            if (camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg)) {
+                Gesture detected_gesture{"none", 0.0};
+                if (RequestGestureDetection("127.0.0.1", 8080, latest_frame_jpeg, detected_gesture)) {
+                    gesture_active_ = detected_gesture.label != "none" && detected_gesture.confidence >= 0.6;
+                }
+            }
+        }
+        RefreshStatusIndicators();
+    }
+
+    void UpdateCameraPreview() {
+#ifdef MIMOCA_HAS_OPENCV
+        cv::Mat frame_bgr;
+        if (!camera_.TryGetLatestFrameBgrCopy(frame_bgr) || frame_bgr.empty()) {
+            return;
+        }
+        cv::Mat frame_rgb;
+        cv::cvtColor(frame_bgr, frame_rgb, cv::COLOR_BGR2RGB);
+        QImage image(frame_rgb.data, frame_rgb.cols, frame_rgb.rows, static_cast<int>(frame_rgb.step),
+                     QImage::Format_RGB888);
+        camera_label_->setPixmap(QPixmap::fromImage(image).scaled(camera_label_->size(), Qt::KeepAspectRatio,
+                                                               Qt::SmoothTransformation));
+#endif
+    }
+
+    void ProcessTurn(const RuntimeIntent& intent) {
+        const CameraSnapshot camera_snapshot = camera_.GetLatestSnapshot();
+        std::vector<Detection> turn_detections;
+        std::vector<uint8_t> latest_frame_jpeg;
+        const bool has_jpeg = sidecar_ok_ && camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg);
+        if (has_jpeg) {
+            RequestVisionDetections("127.0.0.1", 8080, latest_frame_jpeg, turn_detections);
+        }
+
+        std::string utterance = intent.utterance;
+        Gesture turn_gesture = intent.gesture;
+        if (const std::string detected_branch = ResolveBranchSelection(recipe_state_, utterance, turn_gesture);
+            !detected_branch.empty()) {
+            ApplyBranchSelection(recipe_state_, detected_branch, turn_gesture.label == "none" ? "utterance" : "gesture");
+        }
+
+        PlannerResponse response{};
+        PlannerRoundTripStatus planner_status{};
+        const TurnContext turn_context = BuildTurnContext(recipe_state_, utterance, turn_gesture, turn_detections, camera_snapshot);
+
+        if (sidecar_ok_) {
+            planner_status.attempted = true;
+            planner_status.source = "python_sidecar";
+            const auto planner_start = std::chrono::steady_clock::now();
+            if (!RequestMockPlanner("127.0.0.1", 8080, turn_context, response)) {
+                response = LocalRecipeFallback(recipe_state_, FallbackCommandForIntent(intent));
+                planner_status.success = false;
+                planner_status.used_fallback = true;
+                planner_status.source = "local_fallback_after_sidecar_error";
+            } else {
+                planner_status.success = true;
+            }
+            const auto planner_end = std::chrono::steady_clock::now();
+            planner_status.round_trip_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(planner_end - planner_start).count();
+        } else {
+            response = LocalRecipeFallback(recipe_state_, FallbackCommandForIntent(intent));
+            planner_status.success = true;
+            planner_status.used_fallback = true;
+            planner_status.source = "local_fallback_sidecar_unavailable";
+        }
+
+        if (!response.assistant_text.empty()) {
+            AppendChat("assistant", response.assistant_text);
+        }
+        if (response.speak && !response.assistant_text.empty()) {
+            tts_.Speak(response.assistant_text);
+        }
+        if (response.advance_step) {
+            AdvanceCurrentStep(recipe_state_);
+        }
+
+        debug_snapshot_.transcript = utterance.empty() ? debug_snapshot_.transcript : utterance;
+        debug_snapshot_.gesture = turn_gesture;
+        debug_snapshot_.detections = turn_context.detections;
+        debug_snapshot_.recipe_id = recipe_state_.recipe.id;
+        const RecipeStep* current = GetCurrentStep(recipe_state_);
+        debug_snapshot_.step_id = current != nullptr ? current->id : "(none)";
+        debug_snapshot_.branch_id = recipe_state_.selected_branch_by_point.empty()
+                                        ? "(none)"
+                                        : recipe_state_.selected_branch_by_point.begin()->second;
+        debug_snapshot_.planner = planner_status;
+
+        planner_ready_ = planner_status.success;
+        if (debug_mode_enabled_) {
+            debug_text_->setPlainText(DebugSnapshotText(debug_snapshot_));
+        }
+        RefreshStatusIndicators();
+    }
+
+    std::string DebugSnapshotText(const DebugSnapshot& snap) {
+        std::ostringstream oss;
+        oss << "transcript=" << snap.transcript << "\n";
+        oss << "gesture=" << snap.gesture.label << " (" << snap.gesture.confidence << ")\n";
+        oss << "recipe=" << snap.recipe_id << " step=" << snap.step_id << " branch=" << snap.branch_id << "\n";
+        oss << "planner=" << snap.planner.source << " ok=" << (snap.planner.success ? "true" : "false")
+            << " rt_ms=" << snap.planner.round_trip_ms;
+        return oss.str();
+    }
+
+    void RefreshStatusIndicators() {
+        mic_status_->setText(std::string("mic: ").append(mic_active_ ? "active" : "idle").c_str());
+        gesture_status_->setText(std::string("gesture: ").append(gesture_active_ ? "active" : "idle").c_str());
+        planner_status_->setText(std::string("planner: ").append(planner_ready_ ? "ready" : "fallback").c_str());
+        sidecar_status_->setText(std::string("sidecar: ").append(sidecar_ok_ ? "healthy" : "offline").c_str());
+    }
+
+    void AppendChat(const std::string& speaker, const std::string& text) {
+        const QString stamp = QDateTime::currentDateTime().toString("HH:mm:ss");
+        chat_history_->appendPlainText(QString("[%1] %2: %3").arg(stamp, QString::fromStdString(speaker),
+                                                                   QString::fromStdString(text)));
+    }
+
+    QTimer poll_timer_;
+    QLabel* camera_label_ = nullptr;
+    QPlainTextEdit* chat_history_ = nullptr;
+    QLineEdit* input_line_ = nullptr;
+    QCheckBox* dev_toggle_ = nullptr;
+    QPlainTextEdit* debug_text_ = nullptr;
+    QLabel* mic_status_ = nullptr;
+    QLabel* gesture_status_ = nullptr;
+    QLabel* planner_status_ = nullptr;
+    QLabel* sidecar_status_ = nullptr;
+
+    bool startup_failed_ = false;
+    bool sidecar_ok_ = false;
+    bool debug_mode_enabled_ = false;
+    bool startup_prompt_pending_ = false;
+    bool mic_active_ = false;
+    bool gesture_active_ = false;
+    bool planner_ready_ = false;
+
+    RecipeState recipe_state_{};
+    DebugSnapshot debug_snapshot_{};
+    TtsController tts_;
+    SidecarSpeechInputAdapter speech_input_{"127.0.0.1", 8080};
+    CameraController camera_;
+};
+
+int main(int argc, char* argv[]) {
+    QApplication app(argc, argv);
+    MainWindow window;
+    if (window.StartupFailed()) {
+        return 1;
+    }
+    window.show();
+    return app.exec();
+}
+#else
 int main() {
     const auto now = std::chrono::system_clock::now();
     const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
 
     std::cout << "[MiMoCA] Startup at " << std::ctime(&now_time);
     Log("Windows-first prototype shell is running.");
-
-    RecipeState recipe_state{};
-    if (!LoadFirstRecipe("assets/recipes.json", recipe_state.recipe)) {
-        Log("Failed to load startup recipe; exiting.");
-        return 1;
-    }
-    recipe_state.current_step_index = 0;
-
-    const RecipeStep* startup_step = GetCurrentStep(recipe_state);
-    if (startup_step != nullptr) {
-        Log("Current recipe: " + recipe_state.recipe.id + " | current step: " + startup_step->id);
-    }
-
-    Log("Checking Python sidecar at http://127.0.0.1:8080/health");
-    const bool sidecar_ok = CheckPythonHealth("127.0.0.1", 8080);
-    if (!sidecar_ok) {
-        Log("Continuing without Python sidecar (graceful degradation). Start python/service.py to enable it.");
-    }
-
-    TtsController tts;
-    SidecarSpeechInputAdapter speech_input("127.0.0.1", 8080);
-    CameraController camera;
-    bool debug_mode_enabled = false;
-    const std::string debug_env = ToLower(Trim(EnvOrDefault("MIMOCA_DEBUG", "0")));
-    if (debug_env == "1" || debug_env == "true" || debug_env == "on") {
-        debug_mode_enabled = true;
-    }
-    DebugSnapshot debug_snapshot{};
-    camera.Start(0);
-    Log("Speech input adapter: " + speech_input.Name());
-    Log("Debug mode: " + std::string(debug_mode_enabled ? "enabled" : "disabled") +
-        " (set MIMOCA_DEBUG=1 or use 'debug on').");
-
-    Log("Continuous runtime loop active (speech + vision + gestures).");
-    Log("Debug console fallback commands: debug on|off|status | camera | stop | stt-file <wav_path> | "
-        "stt-stream-file <wav_path> | exit");
-
-    DebugConsoleInput debug_console;
-    bool running = true;
-    bool startup_prompt_pending = true;
-    bool gesture_unavailable_logged = false;
-    bool vision_unavailable_logged = false;
-    std::string last_triggered_gesture = "none";
-    auto last_gesture_trigger = std::chrono::steady_clock::now() - std::chrono::seconds(3);
-
-    auto process_turn = [&](const RuntimeIntent& intent, const std::vector<Detection>& detections,
-                            const CameraSnapshot& camera_snapshot) {
-        std::string utterance = intent.utterance;
-        Gesture turn_gesture = intent.gesture;
-        std::vector<Detection> turn_detections = detections;
-        if (const std::string detected_branch = ResolveBranchSelection(recipe_state, utterance, turn_gesture);
-            !detected_branch.empty()) {
-            ApplyBranchSelection(recipe_state, detected_branch, turn_gesture.label == "none" ? "utterance" : "gesture");
-        }
-
-        PlannerResponse response{};
-        const TurnContext turn_context = BuildTurnContext(recipe_state, utterance, turn_gesture, turn_detections, camera_snapshot);
-        PlannerRoundTripStatus planner_status{};
-        if (sidecar_ok) {
-            planner_status.attempted = true;
-            planner_status.source = "python_sidecar";
-            const auto planner_start = std::chrono::steady_clock::now();
-            if (!RequestMockPlanner("127.0.0.1", 8080, turn_context, response)) {
-                const auto planner_end = std::chrono::steady_clock::now();
-                planner_status.round_trip_ms =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(planner_end - planner_start).count();
-                planner_status.success = false;
-                planner_status.used_fallback = true;
-                Log("Planner call failed; using local recipe fallback for this turn.");
-                response = LocalRecipeFallback(recipe_state, FallbackCommandForIntent(intent));
-                planner_status.source = "local_fallback_after_sidecar_error";
-            } else {
-                const auto planner_end = std::chrono::steady_clock::now();
-                planner_status.round_trip_ms =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(planner_end - planner_start).count();
-                planner_status.success = true;
-            }
-        } else {
-            response = LocalRecipeFallback(recipe_state, FallbackCommandForIntent(intent));
-            planner_status.attempted = false;
-            planner_status.success = true;
-            planner_status.used_fallback = true;
-            planner_status.source = "local_fallback_sidecar_unavailable";
-        }
-
-        if (!response.new_branch_id.empty()) {
-            std::string planner_branch = response.new_branch_id;
-            if (planner_branch == "option_a" || planner_branch == "option_b") {
-                const Gesture planner_gesture{planner_branch, 1.0};
-                planner_branch = ResolveBranchSelection(recipe_state, "", planner_gesture);
-            }
-            if (!planner_branch.empty()) {
-                ApplyBranchSelection(recipe_state, planner_branch, "planner_response");
-            }
-        }
-
-        PrintPlannerResponse(response);
-        if (response.speak && !response.assistant_text.empty()) {
-            tts.Speak(response.assistant_text);
-        }
-        if (response.advance_step) {
-            if (AdvanceCurrentStep(recipe_state)) {
-                const RecipeStep* after = GetCurrentStep(recipe_state);
-                if (after != nullptr) {
-                    const std::string active_branch =
-                        recipe_state.selected_branch_by_point.empty() ? "" : recipe_state.selected_branch_by_point.begin()->second;
-                    Log("Advanced to step: " + after->id +
-                        (active_branch.empty() ? "" : " (active branch: " + active_branch + ")"));
-                }
-            } else {
-                Log("No next step to advance to.");
-            }
-        }
-
-        const RecipeStep* debug_current_step = GetCurrentStep(recipe_state);
-        debug_snapshot.transcript = utterance.empty() ? debug_snapshot.transcript : utterance;
-        debug_snapshot.gesture = turn_gesture;
-        debug_snapshot.detections = turn_context.detections;
-        debug_snapshot.recipe_id = recipe_state.recipe.id;
-        debug_snapshot.step_id = debug_current_step != nullptr ? debug_current_step->id : "(none)";
-        debug_snapshot.branch_id =
-            recipe_state.selected_branch_by_point.empty() ? "(none)" : recipe_state.selected_branch_by_point.begin()->second;
-        debug_snapshot.planner = planner_status;
-        if (debug_mode_enabled) {
-            PrintDebugSnapshot(debug_snapshot);
-        }
-    };
-
-    while (running) {
-        RuntimeIntent intent{};
-        const CameraSnapshot camera_snapshot = camera.GetLatestSnapshot();
-        std::vector<Detection> turn_detections;
-        std::vector<uint8_t> latest_frame_jpeg;
-        const bool has_jpeg = sidecar_ok && camera.TryEncodeLatestFrameJpeg(latest_frame_jpeg);
-
-        if (has_jpeg) {
-            if (!RequestVisionDetections("127.0.0.1", 8080, latest_frame_jpeg, turn_detections)) {
-                if (!vision_unavailable_logged) {
-                    Log("Vision detection unavailable; continuing with detections=[].");
-                    vision_unavailable_logged = true;
-                }
-            } else {
-                vision_unavailable_logged = false;
-            }
-        }
-
-        if (startup_prompt_pending) {
-            startup_prompt_pending = false;
-            intent.type = IntentType::kStartupReady;
-            intent.command = "ready";
-            intent.source = "internal";
-        } else {
-            TranscriptEvent transcript_event{};
-            if (sidecar_ok && speech_input.TryConsumeLiveMicrophoneFinalizedEvent(tts, transcript_event)) {
-                intent.type = IntentFromUtterance(transcript_event.text);
-                intent.utterance = transcript_event.text;
-                intent.command = transcript_event.text;
-                intent.source = "speech_live_mic";
-                debug_snapshot.transcript = transcript_event.text;
-                Log("Speech final transcript: '" + transcript_event.text + "'");
-            }
-        }
-
-        if (intent.type == IntentType::kNone && has_jpeg) {
-            Gesture detected_gesture{"none", 0.0};
-            if (RequestGestureDetection("127.0.0.1", 8080, latest_frame_jpeg, detected_gesture)) {
-                if (IsSupportedGestureLabel(detected_gesture.label)) {
-                    const auto now_tp = std::chrono::steady_clock::now();
-                    const bool cooldown_elapsed =
-                        (now_tp - last_gesture_trigger) >= std::chrono::milliseconds(1500);
-                    if (detected_gesture.label != "none" && detected_gesture.confidence >= 0.6 &&
-                        (detected_gesture.label != last_triggered_gesture || cooldown_elapsed)) {
-                        intent.type = IntentFromGestureLabel(detected_gesture.label);
-                        intent.gesture = detected_gesture;
-                        intent.command = detected_gesture.label;
-                        intent.source = "gesture";
-                        last_triggered_gesture = detected_gesture.label;
-                        last_gesture_trigger = now_tp;
-                    }
-                    debug_snapshot.gesture = detected_gesture;
-                }
-                gesture_unavailable_logged = false;
-            } else if (!gesture_unavailable_logged) {
-                Log("Gesture detection unavailable; continuing without gesture-triggered turns.");
-                gesture_unavailable_logged = true;
-            }
-        }
-
-        std::string debug_line;
-        if (debug_console.TryPopLine(debug_line)) {
-            if (debug_line == "exit") {
-                running = false;
-                continue;
-            }
-            if (debug_line == "stop") {
-                tts.Stop();
-            } else if (debug_line == "debug on") {
-                debug_mode_enabled = true;
-                Log("Debug mode enabled.");
-            } else if (debug_line == "debug off") {
-                debug_mode_enabled = false;
-                Log("Debug mode disabled.");
-            } else if (debug_line == "debug status") {
-                Log("Debug mode is " + std::string(debug_mode_enabled ? "enabled" : "disabled") + ".");
-                PrintDebugSnapshot(debug_snapshot);
-            } else if (debug_line == "camera") {
-                std::cout << "[MiMoCA] Camera status: " << camera_snapshot.status_message << '\n';
-                std::cout << "  started: " << (camera_snapshot.camera_started ? "true" : "false") << '\n';
-                std::cout << "  frame_available: " << (camera_snapshot.frame_available ? "true" : "false") << '\n';
-                if (camera_snapshot.frame_available) {
-                    std::cout << "  latest_frame: " << camera_snapshot.width << "x" << camera_snapshot.height << '\n';
-                    std::cout << "  captured_at: " << camera_snapshot.capture_timestamp << '\n';
-                    std::cout << "  frame_count: " << camera_snapshot.frame_count << '\n';
-                }
-            } else {
-                TranscriptEvent debug_transcript{};
-                if (speech_input.TryConsumeConsoleLine(debug_line, debug_transcript) ||
-                    speech_input.TryStreamWavWithVadInterruption(debug_line, tts, debug_transcript)) {
-                    if (!debug_transcript.text.empty()) {
-                        intent.type = IntentFromUtterance(debug_transcript.text);
-                        intent.utterance = debug_transcript.text;
-                        intent.command = debug_transcript.text;
-                        intent.source = "speech_debug_file";
-                    }
-                } else if (!debug_line.empty()) {
-                    Log("Debug command ignored: " + debug_line);
-                }
-            }
-        }
-
-        if (intent.type == IntentType::kExitDebug) {
-            running = false;
-            continue;
-        }
-        if (intent.type != IntentType::kNone) {
-            process_turn(intent, turn_detections, camera_snapshot);
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
-    }
-
-    debug_console.Stop();
-
-    camera.Stop();
-    tts.Stop();
-    Log("TTS interruption: VAD-driven interruption is available through streamed audio path; 'stop' remains manual fallback.");
-    Log("Exiting MiMoCA prototype.");
+    Log("Qt UI is disabled for this build; run on Windows with Qt6 to use the primary UI.");
     return 0;
 }
+#endif
