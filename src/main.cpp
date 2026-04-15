@@ -3325,7 +3325,7 @@ class MainWindow : public QMainWindow {
 
         const auto now = std::chrono::steady_clock::now();
         if (changed && (!last_reported_sidecar_error_at_.has_value() ||
-            now - *last_reported_sidecar_error_at_ >= std::chrono::seconds(30)) {
+            now - *last_reported_sidecar_error_at_ >= std::chrono::seconds(30))) {
             last_reported_sidecar_error_at_ = now;
             const std::string message = "Sidecar online, " + progress_text;
             AppendChat("system", message);
