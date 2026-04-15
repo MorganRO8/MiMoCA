@@ -3612,14 +3612,14 @@ class MainWindow : public QMainWindow {
             }
         }
 
-        if (health.ready_for_turns) {
-            sidecar_startup_error_.clear();
-            return;
-        }
-
         const std::string required_failure = RequiredModalityFailure(health);
         if (!required_failure.empty()) {
             MaybePublishSidecarStartupError(required_failure);
+            return;
+        }
+
+        if (health.ready_for_turns) {
+            sidecar_startup_error_.clear();
             return;
         }
 
