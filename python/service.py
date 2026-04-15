@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import base64
+import importlib.util
 import io
 import os
 import re
@@ -32,7 +33,6 @@ import numpy as np
 import cv2
 import mediapipe as mp
 from faster_whisper import WhisperModel
-from ultralytics import YOLO
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
@@ -678,21 +678,54 @@ class YoloVisionAdapter:
         self.model_name = CONFIG.vision_model
         self.confidence = CONFIG.vision_confidence
         self.vocabulary = list(FIXED_VOCABULARY)
-        self.model: YOLO | None = None
+        self.model: object | None = None
         self.failure_reason = ""
         self.cache_root = CONFIG.vision_cache_root
+        self.optional_unavailable = False
+
+    def _dependency_remediation(self) -> str:
+        return (
+            "install sidecar requirements during bootstrap "
+            "(python/bootstrap_sidecar_env.py with python/requirements.txt) "
+            "to include ultralytics and OpenAI CLIP"
+        )
+
+    def _missing_optional_dependency_reason(self) -> str:
+        if importlib.util.find_spec("ultralytics") is None:
+            return f"vision_optional_dependency_missing: ultralytics not installed; {self._dependency_remediation()}"
+        if "world" in self.model_name.lower() and importlib.util.find_spec("clip") is None:
+            return (
+                "vision_optional_dependency_missing: OpenAI CLIP package is missing for YOLO-World models; "
+                f"{self._dependency_remediation()}"
+            )
+        return ""
 
     def _init_model(self) -> None:
+        self.optional_unavailable = False
+        missing_dependency = self._missing_optional_dependency_reason()
+        if missing_dependency:
+            self.failure_reason = missing_dependency
+            self.model = None
+            self.optional_unavailable = True
+            logging.warning("Vision adapter optional dependency missing: %s", missing_dependency)
+            return
         try:
             os.environ["ULTRALYTICS_HOME"] = self.cache_root
+            os.environ.setdefault("YOLO_AUTOINSTALL", "False")
+            os.environ.setdefault("ULTRALYTICS_AUTOINSTALL", "False")
+            from ultralytics import YOLO  # imported lazily to keep failure reason actionable
+
             self.model = YOLO(self.model_name)
             if "world" in self.model_name.lower():
                 self.model.set_classes(self.vocabulary)
             logging.info("Vision adapter ready: model=%s vocabulary=%s", self.model_name, ",".join(self.vocabulary))
         except Exception as exc:  # noqa: BLE001
-            self.failure_reason = "vision_model_init_failed"
+            self.failure_reason = (
+                "vision_model_init_failed: "
+                f"{exc}. Disable runtime autoinstall and preinstall deps via bootstrap/requirements."
+            )
             self.model = None
-            logging.warning("Vision adapter disabled: %s", exc)
+            logging.warning("Vision adapter disabled: %s", self.failure_reason)
 
     @staticmethod
     def _decode_image(payload: dict) -> np.ndarray:
@@ -841,6 +874,17 @@ class StartupReadinessManager:
         try:
             VISION_ADAPTER._init_model()
             if VISION_ADAPTER.model is None:
+                if VISION_ADAPTER.optional_unavailable:
+                    self.required_modalities.discard("vision")
+                    self._set_modality(
+                        "vision",
+                        status="disabled",
+                        progress=1.0,
+                        message="optional dependency unavailable",
+                        error="",
+                    )
+                    logging.warning("Vision optional dependency unavailable; sidecar remains usable.")
+                    return
                 raise RuntimeError(VISION_ADAPTER.failure_reason or "vision_unavailable")
             self._set_modality("vision", status="ready", progress=1.0, message="ready", error="")
         except Exception as exc:  # noqa: BLE001

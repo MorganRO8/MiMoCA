@@ -49,6 +49,31 @@ def main() -> int:
             detail = (install.stderr or install.stdout).strip()
             raise RuntimeError(f"pip install failed: {detail}")
 
+        vision_check = subprocess.run(
+            [
+                str(interpreter),
+                "-c",
+                (
+                    "import importlib.util\n"
+                    "missing=[]\n"
+                    "missing += ['ultralytics'] if importlib.util.find_spec('ultralytics') is None else []\n"
+                    "missing += ['clip (OpenAI CLIP)'] if importlib.util.find_spec('clip') is None else []\n"
+                    "print(','.join(missing))\n"
+                    "raise SystemExit(1 if missing else 0)\n"
+                ),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if vision_check.returncode != 0:
+            detail = (vision_check.stdout or vision_check.stderr).strip()
+            raise RuntimeError(
+                "vision dependency verification failed. "
+                "Re-run bootstrap so requirements install ultralytics + OpenAI CLIP. "
+                f"Missing: {detail or 'unknown'}"
+            )
+
         print(
             json.dumps(
                 {
