@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -248,6 +249,8 @@ struct AppConfig {
     std::string stt_cache_root;
     std::string vision_cache_root;
     std::string gesture_cache_root;
+    std::string warmup_status = "unknown";
+    std::string warmup_message;
     bool debug_overlay_enabled = false;
 };
 
@@ -917,6 +920,12 @@ AppConfig LoadAppConfig(const std::string& path) {
 
     const std::string debug_json = ExtractJsonFieldObject(json, "debug");
     config.debug_overlay_enabled = ExtractJsonFieldBool(debug_json, "overlay_enabled", false);
+    const std::string warmup_json = ExtractJsonFieldObject(json, "warmup");
+    config.warmup_status = ToLower(Trim(ExtractJsonFieldString(warmup_json, "status")));
+    if (config.warmup_status.empty()) {
+        config.warmup_status = "unknown";
+    }
+    config.warmup_message = Trim(ExtractJsonFieldString(warmup_json, "message"));
     return config;
 }
 
@@ -958,6 +967,10 @@ bool SaveAppConfig(const std::string& path, const AppConfig& config) {
     output << "  },\n";
     output << "  \"debug\": {\n";
     output << "    \"overlay_enabled\": " << BoolJson(config.debug_overlay_enabled) << "\n";
+    output << "  },\n";
+    output << "  \"warmup\": {\n";
+    output << "    \"status\": \"" << EscapeJson(config.warmup_status) << "\",\n";
+    output << "    \"message\": \"" << EscapeJson(config.warmup_message) << "\"\n";
     output << "  }\n";
     output << "}\n";
     return true;
@@ -1033,6 +1046,7 @@ void LogEffectiveConfig(const AppConfig& config) {
         << ",stt=" << config.stt_cache_root
         << ",vision=" << config.vision_cache_root
         << ",gesture=" << config.gesture_cache_root << "]"
+        << " warmup[status=" << config.warmup_status << "]"
         << " secrets[planner_api_key=redacted_secure_store]";
     Log(oss.str());
 }
@@ -1416,13 +1430,24 @@ bool SendHttpRequest(const std::string& host, int port, const std::string& reque
 }
 
 struct SidecarHealthStatus {
+    struct ModalityStatus {
+        std::string status;
+        double progress = 0.0;
+        std::string message;
+        std::string error;
+    };
+
     bool reachable = false;
-    bool ready = false;
+    bool alive = false;
+    bool startup_ready = false;
+    bool ready_for_turns = false;
     std::string summary;
+    std::string app_ready_mode;
     std::string startup_state;
     std::string startup_message;
     double progress = 0.0;
     std::string body;
+    std::unordered_map<std::string, ModalityStatus> modalities;
     std::unordered_map<std::string, std::string> modality_errors;
     std::string top_startup_error;
     std::string planner_mode = "llm";
@@ -1447,7 +1472,10 @@ SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
     const bool http_ok = response.find("200 OK") != std::string::npos;
     const std::string body = ExtractHttpBody(response);
     health.reachable = response.find("HTTP/1.1") != std::string::npos;
-    health.ready = http_ok && ExtractJsonFieldBool(body, "startup_ready", true);
+    health.alive = http_ok && ExtractJsonFieldBool(ExtractJsonFieldObject(body, "transport"), "live", true);
+    health.startup_ready = ExtractJsonFieldBool(body, "startup_ready", false);
+    health.ready_for_turns = ExtractJsonFieldBool(body, "ready_for_turns", health.alive);
+    health.app_ready_mode = Trim(ExtractJsonFieldString(body, "app_ready_mode"));
     health.summary = Trim(ExtractJsonFieldString(body, "startup_summary"));
     health.progress = ExtractJsonFieldDouble(body, "progress", 0.0);
     health.body = body;
@@ -1462,7 +1490,13 @@ SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
         const std::string modalities_json = ExtractJsonFieldObject(startup_json, "modalities");
         for (const std::string modality_name : {"stt", "vision", "gesture"}) {
             const std::string modality_json = ExtractJsonFieldObject(modalities_json, modality_name);
+            SidecarHealthStatus::ModalityStatus modality_status{};
+            modality_status.status = Trim(ExtractJsonFieldString(modality_json, "status"));
+            modality_status.progress = ExtractJsonFieldDouble(modality_json, "progress", 0.0);
+            modality_status.message = Trim(ExtractJsonFieldString(modality_json, "message"));
             const std::string modality_error = Trim(ExtractJsonFieldString(modality_json, "error"));
+            modality_status.error = modality_error;
+            health.modalities[modality_name] = modality_status;
             if (!modality_error.empty()) {
                 health.modality_errors[modality_name] = modality_error;
             }
@@ -1492,10 +1526,10 @@ SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
     health.planner_llm_configured = ExtractJsonFieldBool(body, "planner_llm_configured", false);
     health.planner_llm_ready = ExtractJsonFieldBool(body, "planner_llm_ready", false);
     health.planner_fallback_active = ExtractJsonFieldBool(body, "planner_fallback_active", false);
-    if (health.ready) {
+    if (health.alive) {
         Log("Python sidecar health check succeeded.");
     } else {
-        Log("Python sidecar health check not ready yet.");
+        Log("Python sidecar health check unreachable.");
     }
     Log("Sidecar response preview: " + response.substr(0, std::min<size_t>(response.size(), 180)));
     return health;
@@ -1521,9 +1555,13 @@ class PythonSidecarManager {
 
         progress_callback("Initializing speech/vision services…");
         const SidecarHealthStatus initial_health = QueryPythonHealth(options.host, options.port);
-        if (initial_health.ready) {
+        if (initial_health.alive) {
             ready_ = true;
-            progress_callback("Speech/vision services ready.");
+            if (initial_health.startup_ready) {
+                progress_callback("Speech/vision services ready.");
+            } else {
+                progress_callback("Speech/vision sidecar online; models still initializing.");
+            }
             return true;
         }
 
@@ -1545,15 +1583,24 @@ class PythonSidecarManager {
                 message += " " + health.summary;
             }
             progress_callback(message);
-            if (health.ready) {
+            if (health.alive) {
                 ready_ = true;
-                progress_callback("Speech/vision services ready.");
+                if (health.startup_ready) {
+                    progress_callback("Speech/vision services ready.");
+                } else {
+                    progress_callback("Speech/vision sidecar online; modalities still downloading.");
+                }
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(options.startup_retry_delay_ms));
         }
 
-        ready_ = false;
+        const SidecarHealthStatus post_window_health = QueryPythonHealth(options.host, options.port);
+        ready_ = post_window_health.alive;
+        if (ready_) {
+            progress_callback("Speech/vision sidecar online; initialization continuing in background.");
+            return true;
+        }
         progress_callback("Speech/vision services are offline; using recipe-only fallback.");
         return false;
     }
@@ -1564,11 +1611,13 @@ class PythonSidecarManager {
             return false;
         }
         if (IsManagedProcessAlive()) {
-            ready_ = QueryPythonHealth(options_.host, options_.port).ready;
+            const SidecarHealthStatus health = QueryPythonHealth(options_.host, options_.port);
+            ready_ = health.alive || health.reachable;
             return ready_;
         }
         if (!is_spawned_) {
-            ready_ = QueryPythonHealth(options_.host, options_.port).ready;
+            const SidecarHealthStatus health = QueryPythonHealth(options_.host, options_.port);
+            ready_ = health.alive || health.reachable;
             return ready_;
         }
 
@@ -3220,13 +3269,68 @@ class MainWindow : public QMainWindow {
     }
 
     void UpdateSidecarHealthIssue(const SidecarHealthStatus& health) {
-        sidecar_health_ready_ = health.ready;
-        if (health.ready) {
-            sidecar_startup_error_.clear();
+        latest_sidecar_health_ = health;
+        sidecar_health_ready_ = health.startup_ready;
+        if (!health.reachable || !health.alive) {
+            const std::string detail = !health.top_startup_error.empty() ? health.top_startup_error : "sidecar_unreachable";
+            MaybePublishSidecarStartupError(detail);
             return;
         }
-        const std::string detail = !health.top_startup_error.empty() ? health.top_startup_error : health.summary;
-        MaybePublishSidecarStartupError(detail.empty() ? "sidecar_not_ready" : detail);
+        if (health.startup_ready) {
+            sidecar_startup_error_.clear();
+            if (app_config_.warmup_status != "completed") {
+                app_config_.warmup_status = "completed";
+                app_config_.warmup_message = "core models initialized";
+                SaveAppConfig(app_config_path_, app_config_);
+            }
+            return;
+        }
+        if (app_config_.warmup_status == "unknown") {
+            app_config_.warmup_status = "downloading";
+            app_config_.warmup_message = "models still downloading";
+            SaveAppConfig(app_config_path_, app_config_);
+        }
+
+        std::ostringstream progress;
+        progress << "initializing";
+        if (!health.startup_state.empty()) {
+            progress << " (" << health.startup_state << ")";
+        }
+        progress << " " << std::fixed << std::setprecision(0) << std::clamp(health.progress, 0.0, 1.0) * 100.0 << "%";
+        std::ostringstream signature;
+        signature << health.startup_state << ":" << static_cast<int>(std::clamp(health.progress, 0.0, 1.0) * 100.0);
+        for (const std::string modality_name : {"stt", "vision", "gesture"}) {
+            const auto it = health.modalities.find(modality_name);
+            if (it == health.modalities.end()) {
+                continue;
+            }
+            const auto& modality = it->second;
+            progress << " | " << modality_name << ":";
+            if (!modality.status.empty()) {
+                progress << modality.status;
+            } else {
+                progress << "unknown";
+            }
+            const int modality_percent = static_cast<int>(std::clamp(modality.progress, 0.0, 1.0) * 100.0);
+            progress << " " << std::fixed << std::setprecision(0) << modality_percent << "%";
+            signature << "|" << modality_name << ":" << modality.status << ":" << modality_percent;
+        }
+        const std::string progress_text = progress.str();
+        const std::string signature_text = signature.str();
+        const bool changed = signature_text != last_sidecar_startup_signature_;
+        if (changed) {
+            sidecar_startup_error_ = progress_text;
+            last_sidecar_startup_signature_ = signature_text;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (changed && (!last_reported_sidecar_error_at_.has_value() ||
+            now - *last_reported_sidecar_error_at_ >= std::chrono::seconds(30)) {
+            last_reported_sidecar_error_at_ = now;
+            const std::string message = "Sidecar online, " + progress_text;
+            AppendChat("system", message);
+            Log(message);
+        }
     }
 
     void InitializeSidecarWithProgress() {
@@ -3279,6 +3383,15 @@ class MainWindow : public QMainWindow {
         options.startup_retry_delay_ms = EnvIntOrDefault("MIMOCA_SIDECAR_HEALTH_RETRY_MS", 250);
 
         const auto progress = [this](const std::string& message) {
+            const auto now = std::chrono::steady_clock::now();
+            const bool duplicate = message == last_startup_progress_message_ &&
+                                   last_startup_progress_at_.has_value() &&
+                                   now - *last_startup_progress_at_ < std::chrono::seconds(2);
+            if (duplicate) {
+                return;
+            }
+            last_startup_progress_message_ = message;
+            last_startup_progress_at_ = now;
             statusBar()->showMessage(QString::fromStdString(message));
             sidecar_status_->setText(("sidecar: " + message).c_str());
             QApplication::processEvents();
@@ -3681,6 +3794,7 @@ class MainWindow : public QMainWindow {
 
     void OnPollTick() {
         UpdateCameraPreview();
+        const auto now = std::chrono::steady_clock::now();
 
         if (startup_prompt_pending_) {
             startup_prompt_pending_ = false;
@@ -3710,34 +3824,40 @@ class MainWindow : public QMainWindow {
         }
         mic_active_ = speech_input_.speech_active();
         vad_available_ = speech_input_.vad_available();
-        const bool sidecar_previously_ok = sidecar_ok_;
-        sidecar_ok_ = sidecar_manager_.PollAndRestartIfNeeded([this](const std::string& message) {
-            statusBar()->showMessage(QString::fromStdString(message), 3000);
-            Log(message);
-        });
-        if (sidecar_ok_ && !sidecar_previously_ok) {
-            speech_input_.OnSidecarRestarted();
-            if (app_config_.speech_enabled) {
-                speech_input_.StartConversation();
+        const int health_poll_interval_ms = sidecar_health_ready_ ? 600 : 1500;
+        const bool should_poll_health = !last_health_poll_at_.has_value() ||
+                                        now - *last_health_poll_at_ >= std::chrono::milliseconds(health_poll_interval_ms);
+        if (should_poll_health) {
+            last_health_poll_at_ = now;
+            const bool sidecar_previously_ok = sidecar_ok_;
+            sidecar_ok_ = sidecar_manager_.PollAndRestartIfNeeded([this](const std::string& message) {
+                statusBar()->showMessage(QString::fromStdString(message), 3000);
+                Log(message);
+            });
+            if (sidecar_ok_ && !sidecar_previously_ok) {
+                speech_input_.OnSidecarRestarted();
+                if (app_config_.speech_enabled) {
+                    speech_input_.StartConversation();
+                }
             }
-        }
-        if (sidecar_ok_) {
-            const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
-            UpdateSidecarHealthIssue(health);
-            planner_mode_ = health.planner_mode;
-            planner_llm_configured_ = health.planner_llm_configured;
-            planner_fallback_active_ = health.planner_fallback_active;
-        } else {
-            sidecar_health_ready_ = false;
-            const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
-            if (health.reachable) {
+            if (sidecar_ok_) {
+                const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
                 UpdateSidecarHealthIssue(health);
+                planner_mode_ = health.planner_mode;
+                planner_llm_configured_ = health.planner_llm_configured;
+                planner_fallback_active_ = health.planner_fallback_active;
+            } else {
+                sidecar_health_ready_ = false;
+                const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
+                if (health.reachable) {
+                    UpdateSidecarHealthIssue(health);
+                }
+                planner_fallback_active_ = true;
             }
-            planner_fallback_active_ = true;
-        }
-        if (!sidecar_ok_ && sidecar_manager_.runtime_missing()) {
-            MaybePublishSidecarStartupError("python runtime missing (see log)");
-            sidecar_status_->setText("sidecar: python runtime missing (see log)");
+            if (!sidecar_ok_ && sidecar_manager_.runtime_missing()) {
+                MaybePublishSidecarStartupError("python runtime missing (see log)");
+                sidecar_status_->setText("sidecar: python runtime missing (see log)");
+            }
         }
         MaybeProcessGestureIntent();
         RefreshStatusIndicators();
@@ -3922,6 +4042,18 @@ class MainWindow : public QMainWindow {
         std::string mic_label = "mic: ";
         if (!sidecar_ok_) {
             mic_label += "offline";
+        } else if (const auto it = latest_sidecar_health_.modalities.find("stt");
+                   it != latest_sidecar_health_.modalities.end() && it->second.status != "ready") {
+            const auto& stt = it->second;
+            if (stt.status == "downloading") {
+                mic_label += "downloading model";
+            } else if (stt.status == "failed") {
+                mic_label += "error";
+            } else if (stt.status == "disabled") {
+                mic_label += "disabled";
+            } else {
+                mic_label += "initializing";
+            }
         } else if (!app_config_.speech_enabled) {
             mic_label += "disabled";
         } else if (!vad_available_) {
@@ -3933,7 +4065,25 @@ class MainWindow : public QMainWindow {
         }
         mic_status_->setText(mic_label.c_str());
         tts_status_->setText(std::string("tts: ").append(tts_.IsSpeaking() ? "speaking" : "idle").c_str());
-        std::string gesture_label = "gesture: " + (app_config_.gesture_enabled ? gesture_status_text_ : "disabled");
+        std::string gesture_label = "gesture: ";
+        if (!sidecar_ok_) {
+            gesture_label += "offline";
+        } else if (!app_config_.gesture_enabled) {
+            gesture_label += "disabled";
+        } else if (const auto it = latest_sidecar_health_.modalities.find("gesture");
+                   it != latest_sidecar_health_.modalities.end() && it->second.status != "ready") {
+            if (it->second.status == "downloading") {
+                gesture_label += "initializing";
+            } else if (it->second.status == "failed") {
+                gesture_label += "error";
+            } else if (it->second.status == "disabled") {
+                gesture_label += "disabled";
+            } else {
+                gesture_label += "initializing";
+            }
+        } else {
+            gesture_label += gesture_status_text_;
+        }
         if (gesture_active_) {
             gesture_label += " (active)";
         }
@@ -3953,7 +4103,12 @@ class MainWindow : public QMainWindow {
         planner_status_->setText(planner_label.c_str());
         std::string sidecar_label = "sidecar: ";
         if (!sidecar_ok_) {
-            sidecar_label += "offline";
+            if (app_config_.warmup_status == "skipped" || app_config_.warmup_status == "failed" ||
+                app_config_.warmup_status == "downloading" || app_config_.warmup_status == "pending") {
+                sidecar_label += "models still downloading";
+            } else {
+                sidecar_label += "offline";
+            }
         } else if (!sidecar_health_ready_) {
             sidecar_label += "starting";
         } else {
@@ -4016,7 +4171,12 @@ class MainWindow : public QMainWindow {
     bool planner_fallback_active_ = false;
     std::string planner_mode_ = "llm";
     bool sidecar_health_ready_ = false;
+    SidecarHealthStatus latest_sidecar_health_{};
     std::string sidecar_startup_error_;
+    std::string last_sidecar_startup_signature_;
+    std::optional<std::chrono::steady_clock::time_point> last_health_poll_at_;
+    std::string last_startup_progress_message_;
+    std::optional<std::chrono::steady_clock::time_point> last_startup_progress_at_;
     std::string last_reported_sidecar_error_;
     std::optional<std::chrono::steady_clock::time_point> last_reported_sidecar_error_at_;
 

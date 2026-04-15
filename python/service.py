@@ -54,6 +54,7 @@ DEFAULT_CACHE_ROOT = _default_model_cache_root()
 DEFAULT_STT_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "stt")
 DEFAULT_VISION_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "vision")
 DEFAULT_GESTURE_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "gesture")
+DEFAULT_WARMUP_MARKER_PATH = os.path.join(DEFAULT_CACHE_ROOT, "warmup_state.json")
 
 
 @dataclass
@@ -84,8 +85,10 @@ class RuntimeConfig:
     stt_cache_root: str = DEFAULT_STT_CACHE_ROOT
     vision_cache_root: str = DEFAULT_VISION_CACHE_ROOT
     gesture_cache_root: str = DEFAULT_GESTURE_CACHE_ROOT
-    required_modalities: set[str] = field(default_factory=lambda: {"stt", "vision"})
+    warmup_marker_path: str = DEFAULT_WARMUP_MARKER_PATH
+    required_modalities: set[str] = field(default_factory=set)
     allow_degraded_startup: bool = True
+    first_run_warmup_mode: bool = True
 
 
 def _truthy(raw: str, fallback: bool) -> bool:
@@ -146,9 +149,24 @@ def _load_runtime_config() -> RuntimeConfig:
     config.stt_cache_root = os.getenv("MIMOCA_STT_CACHE_ROOT", os.path.join(config.cache_root, "stt"))
     config.vision_cache_root = os.getenv("MIMOCA_VISION_CACHE_ROOT", os.path.join(config.cache_root, "vision"))
     config.gesture_cache_root = os.getenv("MIMOCA_GESTURE_CACHE_ROOT", os.path.join(config.cache_root, "gesture"))
-    required_raw = os.getenv("MIMOCA_REQUIRED_MODALITIES", ",".join(sorted(config.required_modalities)))
-    config.required_modalities = {item.strip().lower() for item in required_raw.split(",") if item.strip()}
+    config.warmup_marker_path = os.getenv(
+        "MIMOCA_WARMUP_MARKER_PATH",
+        os.path.join(config.cache_root, "warmup_state.json"),
+    )
+    required_raw = os.getenv("MIMOCA_REQUIRED_MODALITIES", "").strip()
+    if required_raw:
+        config.required_modalities = {item.strip().lower() for item in required_raw.split(",") if item.strip()}
+    else:
+        derived_required: set[str] = set()
+        if config.speech_enabled:
+            derived_required.add("stt")
+        if config.vision_enabled:
+            derived_required.add("vision")
+        if config.gesture_enabled:
+            derived_required.add("gesture")
+        config.required_modalities = derived_required
     config.allow_degraded_startup = _truthy(os.getenv("MIMOCA_ALLOW_DEGRADED_STARTUP", "true"), True)
+    config.first_run_warmup_mode = _truthy(os.getenv("MIMOCA_FIRST_RUN_WARMUP_MODE", "true"), True)
     return config
 
 
@@ -740,12 +758,41 @@ class StartupReadinessManager:
         self.message = "starting"
         self.required_modalities = set(CONFIG.required_modalities)
         self.allow_degraded = CONFIG.allow_degraded_startup
+        self.first_run_warmup_mode = CONFIG.first_run_warmup_mode
+        self._warmup_active = self._warmup_mode_active()
         self.modalities: dict[str, ModalityReadiness] = {
             "stt": ModalityReadiness(),
             "vision": ModalityReadiness(),
             "gesture": ModalityReadiness(),
         }
         self._thread: threading.Thread | None = None
+
+    @staticmethod
+    def _cache_has_files(path: str) -> bool:
+        try:
+            root = Path(path)
+            if not root.exists():
+                return False
+            for child in root.rglob("*"):
+                if child.is_file():
+                    return True
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _warmup_mode_active(self) -> bool:
+        if not self.first_run_warmup_mode:
+            return False
+        try:
+            marker_payload = json.loads(Path(CONFIG.warmup_marker_path).read_text(encoding="utf-8"))
+            marker_status = str(marker_payload.get("status", "")).strip().lower()
+            if marker_status == "completed":
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        stt_cold = CONFIG.speech_enabled and not self._cache_has_files(CONFIG.stt_cache_root)
+        vision_cold = CONFIG.vision_enabled and not self._cache_has_files(CONFIG.vision_cache_root)
+        return stt_cold or vision_cold
 
     def _set_modality(self, name: str, **kwargs) -> None:
         with self._lock:
@@ -776,6 +823,9 @@ class StartupReadinessManager:
                 self.updated_at = datetime.now(timezone.utc).isoformat()
 
     def _initialize_stt(self) -> None:
+        if not CONFIG.speech_enabled:
+            self._set_modality("stt", status="disabled", progress=1.0, message="disabled by config", error="")
+            return
         self._set_modality("stt", status="downloading", progress=0.05, message="initializing")
         try:
             SPEECH_ADAPTER._ensure_model_loaded()
@@ -784,6 +834,9 @@ class StartupReadinessManager:
             self._set_modality("stt", status="failed", progress=1.0, message="failed", error=str(exc))
 
     def _initialize_vision(self) -> None:
+        if not CONFIG.vision_enabled:
+            self._set_modality("vision", status="disabled", progress=1.0, message="disabled by config", error="")
+            return
         self._set_modality("vision", status="downloading", progress=0.05, message="initializing")
         try:
             VISION_ADAPTER._init_model()
@@ -794,6 +847,9 @@ class StartupReadinessManager:
             self._set_modality("vision", status="failed", progress=1.0, message="failed", error=str(exc))
 
     def _initialize_gesture(self) -> None:
+        if not CONFIG.gesture_enabled:
+            self._set_modality("gesture", status="disabled", progress=1.0, message="disabled by config", error="")
+            return
         self._set_modality("gesture", status="downloading", progress=0.05, message="ensuring hand model")
         try:
             GESTURE_ADAPTER.ensure_model(progress_callback=lambda p, m: self._set_modality("gesture", progress=p, message=m))
@@ -806,17 +862,23 @@ class StartupReadinessManager:
 
     def _finalize_state(self) -> None:
         with self._lock:
+            warmup_active = self._warmup_active
             required_failures = [
                 name
                 for name, status in self.modalities.items()
                 if name in self.required_modalities and status.status != "ready"
             ]
+            if warmup_active:
+                required_failures = [name for name in required_failures if name not in {"stt", "vision"}]
             if required_failures and not self.allow_degraded:
                 self.state = "failed"
                 self.message = f"required modality init failed: {','.join(required_failures)}"
             elif required_failures and self.allow_degraded:
                 self.state = "degraded"
                 self.message = f"degraded startup: {','.join(required_failures)} unavailable"
+            elif warmup_active:
+                self.state = "degraded"
+                self.message = "first-run warmup mode: core ready while models download"
             else:
                 self.state = "ready"
                 self.message = "all required modalities ready"
@@ -842,6 +904,9 @@ class StartupReadinessManager:
                 "progress": max(0.0, min(1.0, avg_progress)),
                 "required_modalities": sorted(self.required_modalities),
                 "allow_degraded_startup": self.allow_degraded,
+                "first_run_warmup_mode": self.first_run_warmup_mode,
+                "warmup_active": self._warmup_active,
+                "warmup_marker_path": CONFIG.warmup_marker_path,
                 "modalities": {
                     name: {
                         "status": modality.status,
@@ -885,6 +950,29 @@ def _modality_errors(readiness: dict) -> dict[str, str]:
         if error_text:
             result[name] = error_text
     return result
+
+
+def _derive_app_ready_mode(readiness: dict, planner_runtime: dict, planner_status: dict) -> tuple[bool, str]:
+    """Return (ready_for_turns, app_ready_mode) for partial startup operation."""
+    startup_state = str(readiness.get("state", "downloading"))
+    planner_fallback_active = bool(planner_runtime.get("fallback_active", False))
+    planner_mode = str(planner_status.get("mode", "mock")).strip().lower() or "mock"
+    planner_llm_ready = bool(planner_status.get("llm_ready", False))
+    planner_effective_ready = planner_mode != "llm" or planner_llm_ready
+
+    if startup_state == "ready":
+        if planner_effective_ready and not planner_fallback_active:
+            return (True, "full")
+        return (True, "degraded")
+    if startup_state == "degraded":
+        return (True, "degraded" if planner_effective_ready else "core_only")
+    if startup_state == "downloading":
+        # Transport + planner/mock path are available while heavy models download.
+        return (True, "core_only")
+    if startup_state == "failed":
+        # Failed modality bootstrap can still leave mock planning and UI control usable.
+        return (True, "core_only")
+    return (False, "blocked")
 
 
 def _constrain_assistant_text(text: str) -> str:
@@ -1282,6 +1370,8 @@ def _planner_with_fallback(turn_context: dict) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
+    _health_log_counter = 0
+
     def _write_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -1291,27 +1381,67 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args) -> None:
-        logging.info("%s - %s", self.address_string(), fmt % args)
+        rendered = fmt % args
+        if "GET /health " in rendered:
+            logging.debug("%s - %s", self.address_string(), rendered)
+            return
+        logging.info("%s - %s", self.address_string(), rendered)
+
+    def _modality_not_ready_payload(self, modality_name: str) -> dict:
+        readiness = STARTUP_MANAGER.snapshot()
+        modality_info = readiness.get("modalities", {}).get(modality_name, {})
+        return {
+            "error": "model_not_ready",
+            "modality": modality_name,
+            "startup_state": readiness.get("state", "downloading"),
+            "status": modality_info.get("status", "downloading"),
+            "progress": modality_info.get("progress", 0.0),
+            "message": modality_info.get("message", "initializing"),
+            "detail": modality_info.get("error", ""),
+        }
+
+    def _require_modality_ready(self, modality_name: str) -> bool:
+        readiness = STARTUP_MANAGER.snapshot()
+        modality_info = readiness.get("modalities", {}).get(modality_name, {})
+        return str(modality_info.get("status", "")).strip().lower() == "ready"
 
     def do_GET(self) -> None:
-        logging.info("request GET %s", self.path)
+        if self.path == "/health":
+            Handler._health_log_counter += 1
+            if Handler._health_log_counter % 30 == 1:
+                logging.info("request GET %s", self.path)
+            else:
+                logging.debug("request GET %s", self.path)
+        else:
+            logging.info("request GET %s", self.path)
         if self.path == "/health":
             STARTUP_MANAGER.ensure_started()
             readiness = STARTUP_MANAGER.snapshot()
             startup_state = readiness.get("state", "downloading")
-            ready_for_app = startup_state in {"ready", "degraded"}
-            status_code = 200 if ready_for_app else 503
             planner_runtime = _planner_runtime_snapshot()
+            planner_status = {
+                "mode": PLANNER_ADAPTER.mode,
+                "llm_ready": PLANNER_ADAPTER.llm_ready,
+            }
+            ready_for_turns, app_ready_mode = _derive_app_ready_mode(readiness, planner_runtime, planner_status)
+            transport_live = True
             startup_summary = _startup_summary(readiness)
             modality_errors = _modality_errors(readiness)
             self._write_json(
-                status_code,
+                200,
                 {
-                    "status": "ok" if ready_for_app else ("failed" if startup_state == "failed" else "initializing"),
+                    "status": "ok",
                     "service": "mimoca-python-sidecar",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "transport": {
+                        "live": transport_live,
+                        "state": "up",
+                        "message": "service is up and responsive",
+                    },
                     "startup": readiness,
-                    "startup_ready": ready_for_app,
+                    "startup_ready": startup_state in {"ready", "degraded"},
+                    "ready_for_turns": ready_for_turns,
+                    "app_ready_mode": app_ready_mode,
                     "startup_summary": startup_summary,
                     "modality_errors": modality_errors,
                     "stt_model": SPEECH_ADAPTER.model_name,
@@ -1344,6 +1474,8 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._write_json(400, {"error": "invalid_json"})
             return
+
+        STARTUP_MANAGER.ensure_started()
 
         if self.path == "/plan":
             logging.info("serialized TurnContext request: %s", json.dumps(payload, separators=(",", ":")))
@@ -1378,22 +1510,37 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if self.path == "/stt/transcribe":
+                if not self._require_modality_ready("stt"):
+                    self._write_json(503, self._modality_not_ready_payload("stt"))
+                    return
                 result = SPEECH_ADAPTER.transcribe(payload)
                 logging.info("stt transcribe complete: chars=%d final=%s", len(result.get("text", "")), result.get("is_final"))
                 self._write_json(200, result)
                 return
             if self.path == "/stt/session/start":
+                if not self._require_modality_ready("stt"):
+                    self._write_json(503, self._modality_not_ready_payload("stt"))
+                    return
                 self._write_json(200, SPEECH_ADAPTER.start_session(payload))
                 return
             if self.path == "/stt/session/chunk":
+                if not self._require_modality_ready("stt"):
+                    self._write_json(503, self._modality_not_ready_payload("stt"))
+                    return
                 self._write_json(200, SPEECH_ADAPTER.append_chunk(payload))
                 return
             if self.path == "/stt/session/finalize":
+                if not self._require_modality_ready("stt"):
+                    self._write_json(503, self._modality_not_ready_payload("stt"))
+                    return
                 result = SPEECH_ADAPTER.finalize_session(payload)
                 logging.info("stt finalize complete: session_id=%s chars=%d", result.get("session_id"), len(result.get("text", "")))
                 self._write_json(200, result)
                 return
             if self.path == "/gesture/detect":
+                if not self._require_modality_ready("gesture"):
+                    self._write_json(503, self._modality_not_ready_payload("gesture"))
+                    return
                 result = GESTURE_ADAPTER.detect(payload)
                 gesture = result.get("gesture", {})
                 logging.info(
@@ -1405,6 +1552,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_json(200, result)
                 return
             if self.path == "/vision/detect":
+                if not self._require_modality_ready("vision"):
+                    self._write_json(503, self._modality_not_ready_payload("vision"))
+                    return
                 result = VISION_ADAPTER.detect(payload)
                 self._write_json(200, result)
                 return
