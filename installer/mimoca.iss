@@ -33,7 +33,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
 
 [Run]
-Filename: "{app}\scripts\first_launch_setup.ps1"; Parameters: "-InstallRoot \"{app}\""; Flags: runhidden waituntilterminated
+Filename: "{app}\scripts\first_launch_setup.ps1"; Parameters: "-InstallRoot ""{app}"""; Flags: runhidden waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
