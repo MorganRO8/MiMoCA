@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
 #include <vector>
 
 #ifdef MIMOCA_HAS_QT
@@ -264,7 +265,11 @@ struct SidecarBootstrapResult {
 
 void Log(const std::string& message);
 std::string ReadFileText(const std::string& path);
-bool SendHttpRequest(const std::string& host, int port, const std::string& request, std::string& response_out);
+bool SendHttpRequest(const std::string& host,
+                     int port,
+                     const std::string& request,
+                     std::string& response_out,
+                     int timeout_ms = 1200);
 
 #ifdef _WIN32
 class TtsController {
@@ -1345,7 +1350,11 @@ PlannerResponse ParsePlannerResponseBody(const std::string& body) {
     return response;
 }
 
-bool SendHttpRequest(const std::string& host, int port, const std::string& request, std::string& response_out) {
+bool SendHttpRequest(const std::string& host,
+                     int port,
+                     const std::string& request,
+                     std::string& response_out,
+                     const int timeout_ms) {
 #ifdef _WIN32
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
@@ -1361,6 +1370,18 @@ bool SendHttpRequest(const std::string& host, int port, const std::string& reque
         WSACleanup();
 #endif
         return false;
+    }
+
+    if (timeout_ms > 0) {
+#ifdef _WIN32
+        const DWORD timeout_dw = static_cast<DWORD>(timeout_ms);
+        setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_dw), sizeof(timeout_dw));
+        setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_dw), sizeof(timeout_dw));
+#else
+        const timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
     }
 
     sockaddr_in server_addr{};
@@ -2334,7 +2355,8 @@ SttResult FinalizeStreamingSttSession(const std::string& host, int port, const s
 bool RequestGestureDetection(const std::string& host,
                              const int port,
                              const std::vector<uint8_t>& jpeg_bytes,
-                             Gesture& out_gesture) {
+                             Gesture& out_gesture,
+                             const int timeout_ms = 450) {
     if (jpeg_bytes.empty()) {
         return false;
     }
@@ -2350,7 +2372,7 @@ bool RequestGestureDetection(const std::string& host,
         std::to_string(body.size()) + "\r\n\r\n" + body;
 
     std::string response;
-    if (!SendHttpRequest(host, port, request, response)) {
+    if (!SendHttpRequest(host, port, request, response, timeout_ms)) {
         return false;
     }
     const std::string response_body = ExtractHttpBody(response);
@@ -2399,7 +2421,8 @@ std::vector<double> ParseNumberArray(const std::string& json_array) {
 bool RequestVisionDetections(const std::string& host,
                              const int port,
                              const std::vector<uint8_t>& jpeg_bytes,
-                             std::vector<Detection>& out_detections) {
+                             std::vector<Detection>& out_detections,
+                             const int timeout_ms = 550) {
     out_detections.clear();
     if (jpeg_bytes.empty()) {
         return false;
@@ -2416,7 +2439,7 @@ bool RequestVisionDetections(const std::string& host,
         std::to_string(body.size()) + "\r\n\r\n" + body;
 
     std::string response;
-    if (!SendHttpRequest(host, port, request, response)) {
+    if (!SendHttpRequest(host, port, request, response, timeout_ms)) {
         return false;
     }
     const std::string response_body = ExtractHttpBody(response);
@@ -3276,6 +3299,7 @@ class MainWindow : public QMainWindow {
         InitializeSidecarWithProgress();
         EnsurePlannerApiKeyAtStartup();
         camera_.Start(0);
+        StartInferenceWorker();
         RefreshStatusIndicators();
 
         poll_timer_.setInterval(120);
@@ -3287,12 +3311,168 @@ class MainWindow : public QMainWindow {
     }
 
     ~MainWindow() override {
+        StopInferenceWorker();
         sidecar_manager_.Shutdown();
     }
 
     bool StartupFailed() const { return startup_failed_; }
 
    private:
+    struct InferenceTask {
+        uint64_t sequence = 0;
+        std::vector<uint8_t> frame_jpeg;
+        bool run_gesture = false;
+        bool run_vision = false;
+    };
+
+    struct InferenceResult {
+        uint64_t sequence = 0;
+        bool gesture_attempted = false;
+        bool gesture_ok = false;
+        Gesture gesture{"none", 0.0};
+        bool vision_attempted = false;
+        bool vision_ok = false;
+        std::vector<Detection> detections;
+    };
+
+    void StartInferenceWorker() {
+        stop_inference_worker_ = false;
+        inference_worker_thread_ = std::thread([this]() { InferenceWorkerLoop(); });
+    }
+
+    void StopInferenceWorker() {
+        {
+            std::lock_guard<std::mutex> lock(inference_worker_mutex_);
+            stop_inference_worker_ = true;
+        }
+        inference_worker_cv_.notify_all();
+        if (inference_worker_thread_.joinable()) {
+            inference_worker_thread_.join();
+        }
+    }
+
+    void InferenceWorkerLoop() {
+        while (true) {
+            InferenceTask task{};
+            {
+                std::unique_lock<std::mutex> lock(inference_worker_mutex_);
+                inference_worker_cv_.wait(lock, [this]() { return stop_inference_worker_ || inference_pending_.has_value(); });
+                if (stop_inference_worker_) {
+                    return;
+                }
+                task = *inference_pending_;
+                inference_pending_.reset();
+                inference_worker_busy_ = true;
+            }
+
+            InferenceResult result{};
+            result.sequence = task.sequence;
+            if (task.run_gesture) {
+                result.gesture_attempted = true;
+                result.gesture_ok = RequestGestureDetection(
+                    sidecar_host_,
+                    sidecar_port_,
+                    task.frame_jpeg,
+                    result.gesture,
+                    kInferenceGestureTimeoutMs);
+            }
+            if (task.run_vision) {
+                result.vision_attempted = true;
+                result.vision_ok = RequestVisionDetections(
+                    sidecar_host_,
+                    sidecar_port_,
+                    task.frame_jpeg,
+                    result.detections,
+                    kInferenceVisionTimeoutMs);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(inference_worker_mutex_);
+                latest_inference_result_ = result;
+                inference_result_ready_ = true;
+                inference_worker_busy_ = false;
+            }
+        }
+    }
+
+    void SubmitInferenceFrameIfDue(const std::chrono::steady_clock::time_point now) {
+        if (!sidecar_ok_ || (!app_config_.gesture_enabled && !app_config_.vision_enabled)) {
+            return;
+        }
+
+        const bool should_sample_gesture =
+            app_config_.gesture_enabled &&
+            (!last_gesture_submit_at_.has_value() ||
+             now - *last_gesture_submit_at_ >= std::chrono::milliseconds(kGestureSampleIntervalMs));
+        const bool should_sample_vision =
+            app_config_.vision_enabled &&
+            (!last_vision_submit_at_.has_value() ||
+             now - *last_vision_submit_at_ >= std::chrono::milliseconds(kVisionSampleIntervalMs));
+        if (!should_sample_gesture && !should_sample_vision) {
+            return;
+        }
+
+        std::vector<uint8_t> latest_frame_jpeg;
+        if (!camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg)) {
+            if (should_sample_gesture) {
+                gesture_status_text_ = "camera-unavailable";
+                gesture_active_ = false;
+            }
+            return;
+        }
+
+        InferenceTask task{};
+        task.sequence = ++inference_sequence_counter_;
+        task.frame_jpeg = std::move(latest_frame_jpeg);
+        task.run_gesture = should_sample_gesture;
+        task.run_vision = should_sample_vision;
+
+        {
+            std::lock_guard<std::mutex> lock(inference_worker_mutex_);
+            if (inference_pending_.has_value()) {
+                ++dropped_inference_tasks_;
+            }
+            inference_pending_ = std::move(task);
+        }
+        inference_worker_cv_.notify_one();
+        if (should_sample_gesture) {
+            last_gesture_submit_at_ = now;
+        }
+        if (should_sample_vision) {
+            last_vision_submit_at_ = now;
+        }
+    }
+
+    void ConsumeLatestInferenceResult() {
+        std::optional<InferenceResult> maybe_result;
+        {
+            std::lock_guard<std::mutex> lock(inference_worker_mutex_);
+            if (!inference_result_ready_) {
+                return;
+            }
+            maybe_result = latest_inference_result_;
+            inference_result_ready_ = false;
+        }
+        if (!maybe_result.has_value()) {
+            return;
+        }
+        const InferenceResult& result = *maybe_result;
+        if (result.gesture_attempted) {
+            latest_detected_gesture_ = result.gesture;
+            if (!result.gesture_ok) {
+                gesture_status_text_ = "detect-timeout";
+                gesture_active_ = false;
+            } else {
+                gesture_active_ = result.gesture.label != "none" && result.gesture.confidence >= kGestureMinConfidence;
+                gesture_status_text_ =
+                    result.gesture.label + " " + std::to_string(static_cast<int>(result.gesture.confidence * 100.0)) + "%";
+            }
+        }
+        if (result.vision_attempted && result.vision_ok) {
+            latest_turn_detections_ = result.detections;
+        }
+    }
+
     void MaybePublishSidecarStartupError(const std::string& error_text) {
         const std::string trimmed = Trim(error_text);
         if (trimmed.empty()) {
@@ -3885,6 +4065,8 @@ class MainWindow : public QMainWindow {
     void OnPollTick() {
         UpdateCameraPreview();
         const auto now = std::chrono::steady_clock::now();
+        SubmitInferenceFrameIfDue(now);
+        ConsumeLatestInferenceResult();
 
         if (startup_prompt_pending_) {
             startup_prompt_pending_ = false;
@@ -3949,38 +4131,16 @@ class MainWindow : public QMainWindow {
                 sidecar_status_->setText("sidecar: python runtime missing (see log)");
             }
         }
-        MaybeProcessGestureIntent();
+        MaybeProcessGestureIntent(now);
         RefreshStatusIndicators();
     }
 
-    void MaybeProcessGestureIntent() {
-        const auto now = std::chrono::steady_clock::now();
+    void MaybeProcessGestureIntent(const std::chrono::steady_clock::time_point now) {
         if (!sidecar_ok_ || !app_config_.gesture_enabled) {
             gesture_status_text_ = "offline";
             return;
         }
-        if (last_gesture_sample_at_.has_value() &&
-            now - *last_gesture_sample_at_ < std::chrono::milliseconds(kGestureSampleIntervalMs)) {
-            return;
-        }
-        last_gesture_sample_at_ = now;
-
-        std::vector<uint8_t> latest_frame_jpeg;
-        if (!camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg)) {
-            gesture_status_text_ = "camera-unavailable";
-            gesture_active_ = false;
-            return;
-        }
-
-        Gesture detected_gesture{"none", 0.0};
-        if (!RequestGestureDetection(sidecar_host_, sidecar_port_, latest_frame_jpeg, detected_gesture)) {
-            gesture_status_text_ = "detect-error";
-            gesture_active_ = false;
-            return;
-        }
-        gesture_active_ = detected_gesture.label != "none" && detected_gesture.confidence >= kGestureMinConfidence;
-        gesture_status_text_ =
-            detected_gesture.label + " " + std::to_string(static_cast<int>(detected_gesture.confidence * 100.0)) + "%";
+        const Gesture detected_gesture = latest_detected_gesture_;
 
         if (!IsSupportedGestureLabel(detected_gesture.label) || detected_gesture.label == "none" ||
             detected_gesture.confidence < kGestureMinConfidence) {
@@ -4045,12 +4205,7 @@ class MainWindow : public QMainWindow {
 
     void ProcessTurn(const RuntimeIntent& intent) {
         const CameraSnapshot camera_snapshot = camera_.GetLatestSnapshot();
-        std::vector<Detection> turn_detections;
-        std::vector<uint8_t> latest_frame_jpeg;
-        const bool has_jpeg = sidecar_ok_ && app_config_.vision_enabled && camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg);
-        if (has_jpeg) {
-            RequestVisionDetections(sidecar_host_, sidecar_port_, latest_frame_jpeg, turn_detections);
-        }
+        const std::vector<Detection> turn_detections = latest_turn_detections_;
 
         std::string utterance = intent.utterance;
         Gesture turn_gesture = intent.gesture;
@@ -4257,11 +4412,17 @@ class MainWindow : public QMainWindow {
     bool vad_available_ = true;
     bool gesture_active_ = false;
     static constexpr int kGestureSampleIntervalMs = 220;
+    static constexpr int kVisionSampleIntervalMs = 320;
     static constexpr int kGestureDwellMs = 420;
     static constexpr int kGestureCooldownMs = 1500;
+    static constexpr int kInferenceGestureTimeoutMs = 420;
+    static constexpr int kInferenceVisionTimeoutMs = 520;
     static constexpr double kGestureMinConfidence = 0.65;
     std::string gesture_status_text_ = "idle";
-    std::optional<std::chrono::steady_clock::time_point> last_gesture_sample_at_;
+    std::optional<std::chrono::steady_clock::time_point> last_gesture_submit_at_;
+    std::optional<std::chrono::steady_clock::time_point> last_vision_submit_at_;
+    Gesture latest_detected_gesture_{"none", 0.0};
+    std::vector<Detection> latest_turn_detections_;
     std::optional<std::chrono::steady_clock::time_point> dwell_started_at_;
     std::chrono::steady_clock::time_point gesture_cooldown_until_ = std::chrono::steady_clock::time_point::min();
     std::string dwell_label_;
@@ -4274,6 +4435,16 @@ class MainWindow : public QMainWindow {
     std::string sidecar_startup_error_;
     std::string last_sidecar_startup_signature_;
     int sidecar_transport_failure_streak_ = 0;
+    std::mutex inference_worker_mutex_;
+    std::condition_variable inference_worker_cv_;
+    std::thread inference_worker_thread_;
+    std::optional<InferenceTask> inference_pending_;
+    std::optional<InferenceResult> latest_inference_result_;
+    bool inference_result_ready_ = false;
+    bool inference_worker_busy_ = false;
+    bool stop_inference_worker_ = false;
+    uint64_t inference_sequence_counter_ = 0;
+    uint64_t dropped_inference_tasks_ = 0;
     std::optional<std::chrono::steady_clock::time_point> last_health_poll_at_;
     std::string last_startup_progress_message_;
     std::optional<std::chrono::steady_clock::time_point> last_startup_progress_at_;
