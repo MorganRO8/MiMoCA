@@ -249,6 +249,8 @@ struct AppConfig {
     std::string stt_cache_root;
     std::string vision_cache_root;
     std::string gesture_cache_root;
+    std::string warmup_status = "unknown";
+    std::string warmup_message;
     bool debug_overlay_enabled = false;
 };
 
@@ -918,6 +920,12 @@ AppConfig LoadAppConfig(const std::string& path) {
 
     const std::string debug_json = ExtractJsonFieldObject(json, "debug");
     config.debug_overlay_enabled = ExtractJsonFieldBool(debug_json, "overlay_enabled", false);
+    const std::string warmup_json = ExtractJsonFieldObject(json, "warmup");
+    config.warmup_status = ToLower(Trim(ExtractJsonFieldString(warmup_json, "status")));
+    if (config.warmup_status.empty()) {
+        config.warmup_status = "unknown";
+    }
+    config.warmup_message = Trim(ExtractJsonFieldString(warmup_json, "message"));
     return config;
 }
 
@@ -959,6 +967,10 @@ bool SaveAppConfig(const std::string& path, const AppConfig& config) {
     output << "  },\n";
     output << "  \"debug\": {\n";
     output << "    \"overlay_enabled\": " << BoolJson(config.debug_overlay_enabled) << "\n";
+    output << "  },\n";
+    output << "  \"warmup\": {\n";
+    output << "    \"status\": \"" << EscapeJson(config.warmup_status) << "\",\n";
+    output << "    \"message\": \"" << EscapeJson(config.warmup_message) << "\"\n";
     output << "  }\n";
     output << "}\n";
     return true;
@@ -1034,6 +1046,7 @@ void LogEffectiveConfig(const AppConfig& config) {
         << ",stt=" << config.stt_cache_root
         << ",vision=" << config.vision_cache_root
         << ",gesture=" << config.gesture_cache_root << "]"
+        << " warmup[status=" << config.warmup_status << "]"
         << " secrets[planner_api_key=redacted_secure_store]";
     Log(oss.str());
 }
@@ -3265,7 +3278,17 @@ class MainWindow : public QMainWindow {
         }
         if (health.startup_ready) {
             sidecar_startup_error_.clear();
+            if (app_config_.warmup_status != "completed") {
+                app_config_.warmup_status = "completed";
+                app_config_.warmup_message = "core models initialized";
+                SaveAppConfig(app_config_path_, app_config_);
+            }
             return;
+        }
+        if (app_config_.warmup_status == "unknown") {
+            app_config_.warmup_status = "downloading";
+            app_config_.warmup_message = "models still downloading";
+            SaveAppConfig(app_config_path_, app_config_);
         }
 
         std::ostringstream progress;
@@ -4080,7 +4103,12 @@ class MainWindow : public QMainWindow {
         planner_status_->setText(planner_label.c_str());
         std::string sidecar_label = "sidecar: ";
         if (!sidecar_ok_) {
-            sidecar_label += "offline";
+            if (app_config_.warmup_status == "skipped" || app_config_.warmup_status == "failed" ||
+                app_config_.warmup_status == "downloading" || app_config_.warmup_status == "pending") {
+                sidecar_label += "models still downloading";
+            } else {
+                sidecar_label += "offline";
+            }
         } else if (!sidecar_health_ready_) {
             sidecar_label += "starting";
         } else {

@@ -54,6 +54,7 @@ DEFAULT_CACHE_ROOT = _default_model_cache_root()
 DEFAULT_STT_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "stt")
 DEFAULT_VISION_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "vision")
 DEFAULT_GESTURE_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "gesture")
+DEFAULT_WARMUP_MARKER_PATH = os.path.join(DEFAULT_CACHE_ROOT, "warmup_state.json")
 
 
 @dataclass
@@ -84,6 +85,7 @@ class RuntimeConfig:
     stt_cache_root: str = DEFAULT_STT_CACHE_ROOT
     vision_cache_root: str = DEFAULT_VISION_CACHE_ROOT
     gesture_cache_root: str = DEFAULT_GESTURE_CACHE_ROOT
+    warmup_marker_path: str = DEFAULT_WARMUP_MARKER_PATH
     required_modalities: set[str] = field(default_factory=set)
     allow_degraded_startup: bool = True
     first_run_warmup_mode: bool = True
@@ -147,6 +149,10 @@ def _load_runtime_config() -> RuntimeConfig:
     config.stt_cache_root = os.getenv("MIMOCA_STT_CACHE_ROOT", os.path.join(config.cache_root, "stt"))
     config.vision_cache_root = os.getenv("MIMOCA_VISION_CACHE_ROOT", os.path.join(config.cache_root, "vision"))
     config.gesture_cache_root = os.getenv("MIMOCA_GESTURE_CACHE_ROOT", os.path.join(config.cache_root, "gesture"))
+    config.warmup_marker_path = os.getenv(
+        "MIMOCA_WARMUP_MARKER_PATH",
+        os.path.join(config.cache_root, "warmup_state.json"),
+    )
     required_raw = os.getenv("MIMOCA_REQUIRED_MODALITIES", "").strip()
     if required_raw:
         config.required_modalities = {item.strip().lower() for item in required_raw.split(",") if item.strip()}
@@ -777,6 +783,13 @@ class StartupReadinessManager:
     def _warmup_mode_active(self) -> bool:
         if not self.first_run_warmup_mode:
             return False
+        try:
+            marker_payload = json.loads(Path(CONFIG.warmup_marker_path).read_text(encoding="utf-8"))
+            marker_status = str(marker_payload.get("status", "")).strip().lower()
+            if marker_status == "completed":
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         stt_cold = CONFIG.speech_enabled and not self._cache_has_files(CONFIG.stt_cache_root)
         vision_cold = CONFIG.vision_enabled and not self._cache_has_files(CONFIG.vision_cache_root)
         return stt_cold or vision_cold
@@ -893,6 +906,7 @@ class StartupReadinessManager:
                 "allow_degraded_startup": self.allow_degraded,
                 "first_run_warmup_mode": self.first_run_warmup_mode,
                 "warmup_active": self._warmup_active,
+                "warmup_marker_path": CONFIG.warmup_marker_path,
                 "modalities": {
                     name: {
                         "status": modality.status,
