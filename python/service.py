@@ -887,6 +887,24 @@ def _modality_errors(readiness: dict) -> dict[str, str]:
     return result
 
 
+def _derive_app_ready_mode(readiness: dict, planner_runtime: dict) -> tuple[bool, str]:
+    """Return (ready_for_turns, app_ready_mode) for partial startup operation."""
+    startup_state = str(readiness.get("state", "downloading"))
+    planner_fallback_active = bool(planner_runtime.get("fallback_active", False))
+
+    if startup_state == "ready":
+        return (True, "full" if not planner_fallback_active else "degraded")
+    if startup_state == "degraded":
+        return (True, "degraded")
+    if startup_state == "downloading":
+        # Transport + planner/mock path are available while heavy models download.
+        return (True, "core_only")
+    if startup_state == "failed":
+        # Failed modality bootstrap can still leave mock planning and UI control usable.
+        return (True, "core_only")
+    return (False, "blocked")
+
+
 def _constrain_assistant_text(text: str) -> str:
     normalized = re.sub(r"\s+", " ", (text or "").strip())
     if not normalized:
@@ -1299,19 +1317,26 @@ class Handler(BaseHTTPRequestHandler):
             STARTUP_MANAGER.ensure_started()
             readiness = STARTUP_MANAGER.snapshot()
             startup_state = readiness.get("state", "downloading")
-            ready_for_app = startup_state in {"ready", "degraded"}
-            status_code = 200 if ready_for_app else 503
             planner_runtime = _planner_runtime_snapshot()
+            ready_for_turns, app_ready_mode = _derive_app_ready_mode(readiness, planner_runtime)
+            transport_live = True
             startup_summary = _startup_summary(readiness)
             modality_errors = _modality_errors(readiness)
             self._write_json(
-                status_code,
+                200,
                 {
-                    "status": "ok" if ready_for_app else ("failed" if startup_state == "failed" else "initializing"),
+                    "status": "ok",
                     "service": "mimoca-python-sidecar",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "transport": {
+                        "live": transport_live,
+                        "state": "up",
+                        "message": "service is up and responsive",
+                    },
                     "startup": readiness,
-                    "startup_ready": ready_for_app,
+                    "startup_ready": startup_state in {"ready", "degraded"},
+                    "ready_for_turns": ready_for_turns,
+                    "app_ready_mode": app_ready_mode,
                     "startup_summary": startup_summary,
                     "modality_errors": modality_errors,
                     "stt_model": SPEECH_ADAPTER.model_name,
