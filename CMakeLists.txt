@@ -112,23 +112,33 @@ endif()
 
 install(TARGETS mimoca RUNTIME DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/bin)
 if(WIN32)
-  install(CODE "
+  set(MIMOCA_RUNTIME_DEP_DIRECTORIES_CLAUSE "")
+  if(MIMOCA_RUNTIME_DEP_SEARCH_DIRS)
+    set(MIMOCA_RUNTIME_DEP_DIRECTORIES_CLAUSE "DIRECTORIES")
+    foreach(dep_dir IN LISTS MIMOCA_RUNTIME_DEP_SEARCH_DIRS)
+      string(APPEND MIMOCA_RUNTIME_DEP_DIRECTORIES_CLAUSE "\n      \"${dep_dir}\"")
+    endforeach()
+  endif()
+
+  set(MIMOCA_RUNTIME_DEP_INSTALL_CODE [=[
     file(GET_RUNTIME_DEPENDENCIES
-      EXECUTABLES \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/MiMoCA/bin/mimoca.exe\"
-      DIRECTORIES ${MIMOCA_RUNTIME_DEP_SEARCH_DIRS}
+      EXECUTABLES "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@MIMOCA_RELEASE_LAYOUT_ROOT@/bin/mimoca.exe"
+      @MIMOCA_RUNTIME_DEP_DIRECTORIES_CLAUSE@
       RESOLVED_DEPENDENCIES_VAR mimoca_resolved_deps
       UNRESOLVED_DEPENDENCIES_VAR mimoca_unresolved_deps
-      PRE_EXCLUDE_REGEXES \"api-ms-\" \"ext-ms-\"
+      PRE_EXCLUDE_REGEXES "api-ms-" "ext-ms-"
       POST_EXCLUDE_REGEXES
-        \".*[Ww]indows[/\\\\]System32/.*\\.dll\"
-        \".*[Ww]indows[/\\\\]SysWOW64/.*\\.dll\")
+        ".*[Ww]indows[\\/]System32[\\/].*[.]dll"
+        ".*[Ww]indows[\\/]SysWOW64[\\/].*[.]dll")
     foreach(dep IN LISTS mimoca_resolved_deps)
-      file(INSTALL DESTINATION \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/MiMoCA/bin\" TYPE SHARED_LIBRARY FILES \"\${dep}\")
+      file(INSTALL DESTINATION "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@MIMOCA_RELEASE_LAYOUT_ROOT@/bin" TYPE SHARED_LIBRARY FILES "${dep}")
     endforeach()
     if(mimoca_unresolved_deps)
-      message(WARNING \"Unresolved runtime dependencies during install: \${mimoca_unresolved_deps}\")
+      message(WARNING "Unresolved runtime dependencies during install: ${mimoca_unresolved_deps}")
     endif()
-  ")
+  ]=])
+  string(CONFIGURE "${MIMOCA_RUNTIME_DEP_INSTALL_CODE}" MIMOCA_RUNTIME_DEP_INSTALL_CODE @ONLY)
+  install(CODE "${MIMOCA_RUNTIME_DEP_INSTALL_CODE}")
 endif()
 install(DIRECTORY assets/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/assets)
 install(DIRECTORY python/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/python)
