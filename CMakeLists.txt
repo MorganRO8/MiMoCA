@@ -62,8 +62,120 @@ endif()
 
 set(MIMOCA_RELEASE_LAYOUT_ROOT "MiMoCA")
 set(MIMOCA_MANAGED_PYTHON_RUNTIME "" CACHE PATH "Path to a managed Python runtime to package under runtime/python")
+set(MIMOCA_RUNTIME_DEP_SEARCH_DIRS "")
+
+function(mimoca_append_runtime_dir_from_target target_name)
+  if(NOT TARGET ${target_name})
+    return()
+  endif()
+
+  foreach(prop
+      IMPORTED_LOCATION_RELEASE
+      IMPORTED_LOCATION_RELWITHDEBINFO
+      IMPORTED_LOCATION_MINSIZEREL
+      IMPORTED_LOCATION_DEBUG
+      IMPORTED_LOCATION)
+    get_target_property(runtime_location ${target_name} ${prop})
+    if(runtime_location AND EXISTS "${runtime_location}")
+      get_filename_component(runtime_dir "${runtime_location}" DIRECTORY)
+      list(APPEND MIMOCA_RUNTIME_DEP_SEARCH_DIRS "${runtime_dir}")
+    endif()
+  endforeach()
+
+  set(MIMOCA_RUNTIME_DEP_SEARCH_DIRS "${MIMOCA_RUNTIME_DEP_SEARCH_DIRS}" PARENT_SCOPE)
+endfunction()
+
+if(WIN32)
+  if(Qt6_FOUND)
+    mimoca_append_runtime_dir_from_target(Qt6::Core)
+    mimoca_append_runtime_dir_from_target(Qt6::Gui)
+    mimoca_append_runtime_dir_from_target(Qt6::Widgets)
+
+    set(MIMOCA_QT_BIN_DIR "")
+    foreach(qt_core_prop
+        IMPORTED_LOCATION_RELEASE
+        IMPORTED_LOCATION_RELWITHDEBINFO
+        IMPORTED_LOCATION_MINSIZEREL
+        IMPORTED_LOCATION)
+      if(NOT MIMOCA_QT_BIN_DIR)
+        get_target_property(qt_core_location Qt6::Core ${qt_core_prop})
+        if(qt_core_location AND EXISTS "${qt_core_location}")
+          get_filename_component(MIMOCA_QT_BIN_DIR "${qt_core_location}" DIRECTORY)
+        endif()
+      endif()
+    endforeach()
+    if(NOT MIMOCA_QT_BIN_DIR)
+      get_target_property(qt_core_debug_location Qt6::Core IMPORTED_LOCATION_DEBUG)
+      if(qt_core_debug_location AND EXISTS "${qt_core_debug_location}")
+        get_filename_component(MIMOCA_QT_BIN_DIR "${qt_core_debug_location}" DIRECTORY)
+      endif()
+    endif()
+
+    if(MIMOCA_QT_BIN_DIR)
+      get_filename_component(MIMOCA_QT_ROOT_DIR "${MIMOCA_QT_BIN_DIR}" DIRECTORY)
+      set(MIMOCA_QT_PLUGINS_DIR "${MIMOCA_QT_ROOT_DIR}/plugins")
+      set(MIMOCA_QT_QWINDOWS_DLL "${MIMOCA_QT_PLUGINS_DIR}/platforms/qwindows.dll")
+      set(MIMOCA_QT_CONF_PATH "${CMAKE_CURRENT_BINARY_DIR}/mimoca_qt.conf")
+      file(WRITE "${MIMOCA_QT_CONF_PATH}" "[Paths]\nPlugins=.\n")
+      install(FILES "${MIMOCA_QT_CONF_PATH}" DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/bin RENAME qt.conf)
+      if(EXISTS "${MIMOCA_QT_QWINDOWS_DLL}")
+        install(FILES "${MIMOCA_QT_QWINDOWS_DLL}" DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/bin/platforms)
+      else()
+        message(WARNING "Qt platform plugin not found for packaging: ${MIMOCA_QT_QWINDOWS_DLL}")
+      endif()
+    else()
+      message(WARNING "Unable to determine Qt bin directory for plugin packaging.")
+    endif()
+  endif()
+
+  if(OpenCV_FOUND)
+    foreach(opencv_lib IN LISTS OpenCV_LIBS)
+      if(TARGET ${opencv_lib})
+        mimoca_append_runtime_dir_from_target(${opencv_lib})
+      elseif(IS_ABSOLUTE "${opencv_lib}" AND EXISTS "${opencv_lib}")
+        get_filename_component(opencv_lib_dir "${opencv_lib}" DIRECTORY)
+        list(APPEND MIMOCA_RUNTIME_DEP_SEARCH_DIRS "${opencv_lib_dir}")
+        if(opencv_lib_dir MATCHES [[[/\\]lib$]])
+          get_filename_component(opencv_root_dir "${opencv_lib_dir}" DIRECTORY)
+          list(APPEND MIMOCA_RUNTIME_DEP_SEARCH_DIRS "${opencv_root_dir}/bin")
+        endif()
+      endif()
+    endforeach()
+  endif()
+
+  list(REMOVE_DUPLICATES MIMOCA_RUNTIME_DEP_SEARCH_DIRS)
+endif()
 
 install(TARGETS mimoca RUNTIME DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/bin)
+if(WIN32)
+  set(MIMOCA_RUNTIME_DEP_DIRECTORIES_CLAUSE "")
+  if(MIMOCA_RUNTIME_DEP_SEARCH_DIRS)
+    set(MIMOCA_RUNTIME_DEP_DIRECTORIES_CLAUSE "DIRECTORIES")
+    foreach(dep_dir IN LISTS MIMOCA_RUNTIME_DEP_SEARCH_DIRS)
+      string(APPEND MIMOCA_RUNTIME_DEP_DIRECTORIES_CLAUSE "\n      \"${dep_dir}\"")
+    endforeach()
+  endif()
+
+  set(MIMOCA_RUNTIME_DEP_INSTALL_CODE [=[
+    file(GET_RUNTIME_DEPENDENCIES
+      EXECUTABLES "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@MIMOCA_RELEASE_LAYOUT_ROOT@/bin/mimoca.exe"
+      @MIMOCA_RUNTIME_DEP_DIRECTORIES_CLAUSE@
+      RESOLVED_DEPENDENCIES_VAR mimoca_resolved_deps
+      UNRESOLVED_DEPENDENCIES_VAR mimoca_unresolved_deps
+      PRE_EXCLUDE_REGEXES "api-ms-" "ext-ms-"
+      POST_EXCLUDE_REGEXES
+        ".*[Ww]indows[\\/]System32[\\/].*[.]dll"
+        ".*[Ww]indows[\\/]SysWOW64[\\/].*[.]dll")
+    foreach(dep IN LISTS mimoca_resolved_deps)
+      file(INSTALL DESTINATION "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@MIMOCA_RELEASE_LAYOUT_ROOT@/bin" TYPE SHARED_LIBRARY FILES "${dep}")
+    endforeach()
+    if(mimoca_unresolved_deps)
+      message(WARNING "Unresolved runtime dependencies during install: ${mimoca_unresolved_deps}")
+    endif()
+  ]=])
+  string(CONFIGURE "${MIMOCA_RUNTIME_DEP_INSTALL_CODE}" MIMOCA_RUNTIME_DEP_INSTALL_CODE @ONLY)
+  install(CODE "${MIMOCA_RUNTIME_DEP_INSTALL_CODE}")
+endif()
 install(DIRECTORY assets/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/assets)
 install(DIRECTORY python/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/python)
 install(DIRECTORY scripts/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/scripts)
