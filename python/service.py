@@ -40,7 +40,17 @@ HOST = "127.0.0.1"
 PORT = 8080
 DEFAULT_LLM_MAX_OUTPUT_CHARS = 220
 FIXED_VOCABULARY = ["onion", "knife", "cutting board", "pot", "pan", "bowl", "spoon", "rice cooker"]
-DEFAULT_CACHE_ROOT = os.path.join("python", "model_cache")
+
+
+def _default_model_cache_root() -> str:
+    if os.name == "nt":
+        local_appdata = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if local_appdata:
+            return os.path.join(local_appdata, "MiMoCA", "model_cache")
+    return os.path.join("python", "model_cache")
+
+
+DEFAULT_CACHE_ROOT = _default_model_cache_root()
 DEFAULT_STT_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "stt")
 DEFAULT_VISION_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "vision")
 DEFAULT_GESTURE_CACHE_ROOT = os.path.join(DEFAULT_CACHE_ROOT, "gesture")
