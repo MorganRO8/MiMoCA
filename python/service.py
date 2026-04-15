@@ -500,6 +500,7 @@ class MediaPipeGestureAdapter:
     """Hand Landmarker + tiny fixed gesture vocabulary."""
 
     SUPPORTED_LABELS = {"next", "repeat", "option_a", "option_b", "none"}
+    ACTION_MIN_CONFIDENCE = {"next": 0.84, "repeat": 0.83, "option_a": 0.86, "option_b": 0.86}
 
     def __init__(self) -> None:
         self.model_path = CONFIG.gesture_model_path
@@ -517,9 +518,9 @@ class MediaPipeGestureAdapter:
             options = vision.HandLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=self._resolved_model_path),
                 num_hands=1,
-                min_hand_detection_confidence=0.4,
-                min_hand_presence_confidence=0.4,
-                min_tracking_confidence=0.4,
+                min_hand_detection_confidence=0.62,
+                min_hand_presence_confidence=0.62,
+                min_tracking_confidence=0.6,
             )
             self.landmarker = vision.HandLandmarker.create_from_options(options)
             logging.info("Gesture adapter ready with MediaPipe model: %s", self._resolved_model_path)
@@ -623,6 +624,9 @@ class MediaPipeGestureAdapter:
             heuristic_confidence = 0.75
 
         confidence = max(0.0, min(1.0, (0.55 * detection_score) + (0.45 * heuristic_confidence)))
+        if label in self.ACTION_MIN_CONFIDENCE and confidence < self.ACTION_MIN_CONFIDENCE[label]:
+            label = "none"
+            confidence = 0.0
         return {
             "label": label,
             "confidence": confidence,

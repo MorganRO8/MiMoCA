@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cctype>
 #include <condition_variable>
+#include <cmath>
 #include <vector>
 
 #ifdef MIMOCA_HAS_QT
@@ -253,6 +254,8 @@ struct AppConfig {
     std::string warmup_status = "unknown";
     std::string warmup_message;
     bool debug_overlay_enabled = false;
+    double gesture_confidence_threshold = 0.72;
+    int gesture_dwell_ms = 600;
 };
 
 struct SidecarBootstrapResult {
@@ -848,6 +851,21 @@ bool ParseInt(const std::string& text, int& out_value) {
     return true;
 }
 
+bool ParseDouble(const std::string& text, double& out_value) {
+    const std::string trimmed = Trim(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+    const char* begin = trimmed.c_str();
+    char* end = nullptr;
+    const double parsed = std::strtod(begin, &end);
+    if (end == begin || (end != nullptr && *end != '\0') || !std::isfinite(parsed)) {
+        return false;
+    }
+    out_value = parsed;
+    return true;
+}
+
 std::string CachePathOrDefault(const std::string& root, const std::string& leaf) {
     if (root.empty()) {
         return "";
@@ -925,6 +943,15 @@ AppConfig LoadAppConfig(const std::string& path) {
 
     const std::string debug_json = ExtractJsonFieldObject(json, "debug");
     config.debug_overlay_enabled = ExtractJsonFieldBool(debug_json, "overlay_enabled", false);
+    const std::string gesture_json = ExtractJsonFieldObject(json, "gesture");
+    double parsed_gesture_confidence = config.gesture_confidence_threshold;
+    if (ParseDouble(ExtractJsonFieldString(gesture_json, "confidence_threshold"), parsed_gesture_confidence)) {
+        config.gesture_confidence_threshold = std::clamp(parsed_gesture_confidence, 0.5, 0.99);
+    }
+    int parsed_gesture_dwell_ms = config.gesture_dwell_ms;
+    if (ParseInt(ExtractJsonFieldString(gesture_json, "dwell_ms"), parsed_gesture_dwell_ms)) {
+        config.gesture_dwell_ms = std::clamp(parsed_gesture_dwell_ms, 200, 2000);
+    }
     const std::string warmup_json = ExtractJsonFieldObject(json, "warmup");
     config.warmup_status = ToLower(Trim(ExtractJsonFieldString(warmup_json, "status")));
     if (config.warmup_status.empty()) {
@@ -972,6 +999,10 @@ bool SaveAppConfig(const std::string& path, const AppConfig& config) {
     output << "  },\n";
     output << "  \"debug\": {\n";
     output << "    \"overlay_enabled\": " << BoolJson(config.debug_overlay_enabled) << "\n";
+    output << "  },\n";
+    output << "  \"gesture\": {\n";
+    output << "    \"confidence_threshold\": \"" << config.gesture_confidence_threshold << "\",\n";
+    output << "    \"dwell_ms\": \"" << config.gesture_dwell_ms << "\"\n";
     output << "  },\n";
     output << "  \"warmup\": {\n";
     output << "    \"status\": \"" << EscapeJson(config.warmup_status) << "\",\n";
@@ -1028,6 +1059,12 @@ void ApplyEnvOverrides(AppConfig& config) {
     if (!debug_env.empty()) {
         config.debug_overlay_enabled = debug_env == "1" || debug_env == "true" || debug_env == "on";
     }
+    double env_gesture_confidence = config.gesture_confidence_threshold;
+    if (ParseDouble(EnvOrDefault("MIMOCA_GESTURE_CONFIDENCE_THRESHOLD", ""), env_gesture_confidence)) {
+        config.gesture_confidence_threshold = std::clamp(env_gesture_confidence, 0.5, 0.99);
+    }
+    const int env_gesture_dwell_ms = EnvIntOrDefault("MIMOCA_GESTURE_DWELL_MS", config.gesture_dwell_ms);
+    config.gesture_dwell_ms = std::clamp(env_gesture_dwell_ms, 200, 2000);
 }
 
 void LogEffectiveConfig(const AppConfig& config) {
@@ -1051,6 +1088,8 @@ void LogEffectiveConfig(const AppConfig& config) {
         << ",stt=" << config.stt_cache_root
         << ",vision=" << config.vision_cache_root
         << ",gesture=" << config.gesture_cache_root << "]"
+        << " gesture[confidence_threshold=" << config.gesture_confidence_threshold
+        << ",dwell_ms=" << config.gesture_dwell_ms << "]"
         << " warmup[status=" << config.warmup_status << "]"
         << " secrets[planner_api_key=redacted_secure_store]";
     Log(oss.str());
@@ -3308,6 +3347,7 @@ class MainWindow : public QMainWindow {
 
         startup_prompt_pending_ = true;
         AppendChat("system", "UI ready. Ask 'what next?' by voice or type below.");
+        AppendChat("system", "Gesture help: open hand=next, pinch=repeat, index=option A, two fingers=option B. Hold to confirm.");
     }
 
     ~MainWindow() override {
@@ -3463,13 +3503,32 @@ class MainWindow : public QMainWindow {
                 gesture_status_text_ = "detect-timeout";
                 gesture_active_ = false;
             } else {
-                gesture_active_ = result.gesture.label != "none" && result.gesture.confidence >= kGestureMinConfidence;
+                gesture_active_ = result.gesture.label != "none" &&
+                                  result.gesture.confidence >= app_config_.gesture_confidence_threshold;
                 gesture_status_text_ =
                     result.gesture.label + " " + std::to_string(static_cast<int>(result.gesture.confidence * 100.0)) + "%";
+                if (result.gesture.label != "none" &&
+                    (!IsSupportedGestureLabel(result.gesture.label) ||
+                     result.gesture.confidence < app_config_.gesture_confidence_threshold)) {
+                    RecordGestureFalsePositive(result.gesture.label, result.gesture.confidence, "below_threshold_or_unsupported");
+                }
             }
         }
         if (result.vision_attempted && result.vision_ok) {
             latest_turn_detections_ = result.detections;
+        }
+    }
+
+    void RecordGestureFalsePositive(const std::string& label, const double confidence, const std::string& reason) {
+        const std::string normalized_label = label.empty() ? "unknown" : label;
+        const int updated = ++gesture_false_positive_counters_[normalized_label];
+        if (updated == 1 || updated % 5 == 0) {
+            std::ostringstream oss;
+            oss << "gesture false-positive counter: label=" << normalized_label
+                << " count=" << updated
+                << " confidence=" << std::fixed << std::setprecision(2) << confidence
+                << " reason=" << reason;
+            Log(oss.str());
         }
     }
 
@@ -4003,6 +4062,18 @@ class MainWindow : public QMainWindow {
         runtime_settings_btn_ = new QPushButton("Runtime settings", this);
         right->addWidget(runtime_settings_btn_);
 
+        auto* gesture_help = new QLabel(
+            "Gesture help:\n"
+            "• Next: open hand, hold steady.\n"
+            "• Repeat: pinch thumb + index, hold.\n"
+            "• Option A: point with index finger.\n"
+            "• Option B: raise index + middle fingers.\n"
+            "Hold gesture until status reaches 100% to confirm.",
+            this);
+        gesture_help->setWordWrap(true);
+        gesture_help->setStyleSheet("QLabel { color: #9ad; font-size: 11px; }");
+        right->addWidget(gesture_help);
+
         dev_toggle_ = new QCheckBox("Developer debug", this);
         dev_toggle_->setChecked(debug_mode_enabled_);
         right->addWidget(dev_toggle_);
@@ -4143,7 +4214,7 @@ class MainWindow : public QMainWindow {
         const Gesture detected_gesture = latest_detected_gesture_;
 
         if (!IsSupportedGestureLabel(detected_gesture.label) || detected_gesture.label == "none" ||
-            detected_gesture.confidence < kGestureMinConfidence) {
+            detected_gesture.confidence < app_config_.gesture_confidence_threshold) {
             dwell_label_.clear();
             dwell_started_at_.reset();
             return;
@@ -4154,8 +4225,17 @@ class MainWindow : public QMainWindow {
             dwell_started_at_ = now;
             return;
         }
-        if (!dwell_started_at_.has_value() ||
-            now - *dwell_started_at_ < std::chrono::milliseconds(kGestureDwellMs)) {
+        if (!dwell_started_at_.has_value()) {
+            return;
+        }
+        const auto dwell_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *dwell_started_at_).count();
+        const int dwell_required_ms = std::max(200, app_config_.gesture_dwell_ms);
+        const int hold_progress = static_cast<int>(std::clamp(
+            static_cast<double>(dwell_elapsed) / static_cast<double>(dwell_required_ms),
+            0.0,
+            1.0) * 100.0);
+        gesture_status_text_ = detected_gesture.label + " hold " + std::to_string(hold_progress) + "%";
+        if (dwell_elapsed < dwell_required_ms) {
             return;
         }
         if (now < gesture_cooldown_until_) {
@@ -4413,11 +4493,9 @@ class MainWindow : public QMainWindow {
     bool gesture_active_ = false;
     static constexpr int kGestureSampleIntervalMs = 220;
     static constexpr int kVisionSampleIntervalMs = 320;
-    static constexpr int kGestureDwellMs = 420;
     static constexpr int kGestureCooldownMs = 1500;
     static constexpr int kInferenceGestureTimeoutMs = 420;
     static constexpr int kInferenceVisionTimeoutMs = 520;
-    static constexpr double kGestureMinConfidence = 0.65;
     std::string gesture_status_text_ = "idle";
     std::optional<std::chrono::steady_clock::time_point> last_gesture_submit_at_;
     std::optional<std::chrono::steady_clock::time_point> last_vision_submit_at_;
@@ -4445,6 +4523,7 @@ class MainWindow : public QMainWindow {
     bool stop_inference_worker_ = false;
     uint64_t inference_sequence_counter_ = 0;
     uint64_t dropped_inference_tasks_ = 0;
+    std::unordered_map<std::string, int> gesture_false_positive_counters_;
     std::optional<std::chrono::steady_clock::time_point> last_health_poll_at_;
     std::string last_startup_progress_message_;
     std::optional<std::chrono::steady_clock::time_point> last_startup_progress_at_;
