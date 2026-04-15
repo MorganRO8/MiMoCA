@@ -952,15 +952,20 @@ def _modality_errors(readiness: dict) -> dict[str, str]:
     return result
 
 
-def _derive_app_ready_mode(readiness: dict, planner_runtime: dict) -> tuple[bool, str]:
+def _derive_app_ready_mode(readiness: dict, planner_runtime: dict, planner_status: dict) -> tuple[bool, str]:
     """Return (ready_for_turns, app_ready_mode) for partial startup operation."""
     startup_state = str(readiness.get("state", "downloading"))
     planner_fallback_active = bool(planner_runtime.get("fallback_active", False))
+    planner_mode = str(planner_status.get("mode", "mock")).strip().lower() or "mock"
+    planner_llm_ready = bool(planner_status.get("llm_ready", False))
+    planner_effective_ready = planner_mode != "llm" or planner_llm_ready
 
     if startup_state == "ready":
-        return (True, "full" if not planner_fallback_active else "degraded")
-    if startup_state == "degraded":
+        if planner_effective_ready and not planner_fallback_active:
+            return (True, "full")
         return (True, "degraded")
+    if startup_state == "degraded":
+        return (True, "degraded" if planner_effective_ready else "core_only")
     if startup_state == "downloading":
         # Transport + planner/mock path are available while heavy models download.
         return (True, "core_only")
@@ -1414,7 +1419,11 @@ class Handler(BaseHTTPRequestHandler):
             readiness = STARTUP_MANAGER.snapshot()
             startup_state = readiness.get("state", "downloading")
             planner_runtime = _planner_runtime_snapshot()
-            ready_for_turns, app_ready_mode = _derive_app_ready_mode(readiness, planner_runtime)
+            planner_status = {
+                "mode": PLANNER_ADAPTER.mode,
+                "llm_ready": PLANNER_ADAPTER.llm_ready,
+            }
+            ready_for_turns, app_ready_mode = _derive_app_ready_mode(readiness, planner_runtime, planner_status)
             transport_live = True
             startup_summary = _startup_summary(readiness)
             modality_errors = _modality_errors(readiness)
