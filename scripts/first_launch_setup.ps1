@@ -58,7 +58,24 @@ if (-not (Test-Path $configPath)) {
     $config = @{
         sidecar_env_path = $venvPath
         planner_mode = 'llm'
-    } | ConvertTo-Json
+        planner = @{
+            mode = 'llm'
+            provider = 'openai_compatible'
+            base_url = 'https://api.openai.com/v1'
+            model = 'gpt-4o-mini'
+        }
+        model_paths = @{
+            stt_model = 'distil-large-v3'
+            vision_model = 'yolov8s-worldv2.pt'
+            gesture_model_path = 'python/models/hand_landmarker.task'
+        }
+        cache = @{
+            model_cache_root = $modelCacheRoot
+            stt_cache_root = (Join-Path $modelCacheRoot 'stt')
+            vision_cache_root = (Join-Path $modelCacheRoot 'vision')
+            gesture_cache_root = (Join-Path $modelCacheRoot 'gesture')
+        }
+    } | ConvertTo-Json -Depth 6
     Set-Content -Path $configPath -Value $config -Encoding UTF8
 }
 

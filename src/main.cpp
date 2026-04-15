@@ -244,6 +244,10 @@ struct AppConfig {
     std::string stt_model = "distil-large-v3";
     std::string vision_model = "yolov8s-worldv2.pt";
     std::string gesture_model_path = "python/models/hand_landmarker.task";
+    std::string cache_root;
+    std::string stt_cache_root;
+    std::string vision_cache_root;
+    std::string gesture_cache_root;
     bool debug_overlay_enabled = false;
 };
 
@@ -836,6 +840,13 @@ bool ParseInt(const std::string& text, int& out_value) {
     return true;
 }
 
+std::string CachePathOrDefault(const std::string& root, const std::string& leaf) {
+    if (root.empty()) {
+        return "";
+    }
+    return (std::filesystem::path(root) / std::filesystem::path(leaf)).string();
+}
+
 AppConfig LoadAppConfig(const std::string& path) {
     AppConfig config{};
     const std::string json = ReadFileText(path);
@@ -895,6 +906,14 @@ AppConfig LoadAppConfig(const std::string& path) {
     if (!gesture_model_path.empty()) {
         config.gesture_model_path = gesture_model_path;
     }
+    const std::string cache_json = ExtractJsonFieldObject(json, "cache");
+    config.cache_root = Trim(ExtractJsonFieldString(cache_json, "model_cache_root"));
+    if (config.cache_root.empty()) {
+        config.cache_root = Trim(ExtractJsonFieldString(cache_json, "cache_root"));
+    }
+    config.stt_cache_root = Trim(ExtractJsonFieldString(cache_json, "stt_cache_root"));
+    config.vision_cache_root = Trim(ExtractJsonFieldString(cache_json, "vision_cache_root"));
+    config.gesture_cache_root = Trim(ExtractJsonFieldString(cache_json, "gesture_cache_root"));
 
     const std::string debug_json = ExtractJsonFieldObject(json, "debug");
     config.debug_overlay_enabled = ExtractJsonFieldBool(debug_json, "overlay_enabled", false);
@@ -931,6 +950,12 @@ bool SaveAppConfig(const std::string& path, const AppConfig& config) {
     output << "    \"vision_model\": \"" << EscapeJson(config.vision_model) << "\",\n";
     output << "    \"gesture_model_path\": \"" << EscapeJson(config.gesture_model_path) << "\"\n";
     output << "  },\n";
+    output << "  \"cache\": {\n";
+    output << "    \"model_cache_root\": \"" << EscapeJson(config.cache_root) << "\",\n";
+    output << "    \"stt_cache_root\": \"" << EscapeJson(config.stt_cache_root) << "\",\n";
+    output << "    \"vision_cache_root\": \"" << EscapeJson(config.vision_cache_root) << "\",\n";
+    output << "    \"gesture_cache_root\": \"" << EscapeJson(config.gesture_cache_root) << "\"\n";
+    output << "  },\n";
     output << "  \"debug\": {\n";
     output << "    \"overlay_enabled\": " << BoolJson(config.debug_overlay_enabled) << "\n";
     output << "  }\n";
@@ -965,6 +990,22 @@ void ApplyEnvOverrides(AppConfig& config) {
     if (!gesture_model.empty()) {
         config.gesture_model_path = gesture_model;
     }
+    const std::string cache_root = Trim(EnvOrDefault("MIMOCA_MODEL_CACHE_ROOT", ""));
+    if (!cache_root.empty()) {
+        config.cache_root = cache_root;
+    }
+    const std::string stt_cache_root = Trim(EnvOrDefault("MIMOCA_STT_CACHE_ROOT", ""));
+    if (!stt_cache_root.empty()) {
+        config.stt_cache_root = stt_cache_root;
+    }
+    const std::string vision_cache_root = Trim(EnvOrDefault("MIMOCA_VISION_CACHE_ROOT", ""));
+    if (!vision_cache_root.empty()) {
+        config.vision_cache_root = vision_cache_root;
+    }
+    const std::string gesture_cache_root = Trim(EnvOrDefault("MIMOCA_GESTURE_CACHE_ROOT", ""));
+    if (!gesture_cache_root.empty()) {
+        config.gesture_cache_root = gesture_cache_root;
+    }
     const std::string debug_env = ToLower(Trim(EnvOrDefault("MIMOCA_DEBUG", "")));
     if (!debug_env.empty()) {
         config.debug_overlay_enabled = debug_env == "1" || debug_env == "true" || debug_env == "on";
@@ -988,6 +1029,10 @@ void LogEffectiveConfig(const AppConfig& config) {
         << " model_paths[stt=" << config.stt_model
         << ",vision=" << config.vision_model
         << ",gesture=" << config.gesture_model_path << "]"
+        << " cache[model=" << config.cache_root
+        << ",stt=" << config.stt_cache_root
+        << ",vision=" << config.vision_cache_root
+        << ",gesture=" << config.gesture_cache_root << "]"
         << " secrets[planner_api_key=redacted_secure_store]";
     Log(oss.str());
 }
@@ -1374,8 +1419,12 @@ struct SidecarHealthStatus {
     bool reachable = false;
     bool ready = false;
     std::string summary;
+    std::string startup_state;
+    std::string startup_message;
     double progress = 0.0;
     std::string body;
+    std::unordered_map<std::string, std::string> modality_errors;
+    std::string top_startup_error;
     std::string planner_mode = "llm";
     bool planner_llm_configured = false;
     bool planner_llm_ready = false;
@@ -1399,9 +1448,43 @@ SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
     const std::string body = ExtractHttpBody(response);
     health.reachable = response.find("HTTP/1.1") != std::string::npos;
     health.ready = http_ok && ExtractJsonFieldBool(body, "startup_ready", true);
-    health.summary = ExtractJsonFieldString(body, "startup_summary");
+    health.summary = Trim(ExtractJsonFieldString(body, "startup_summary"));
     health.progress = ExtractJsonFieldDouble(body, "progress", 0.0);
     health.body = body;
+    const std::string startup_json = ExtractJsonFieldObject(body, "startup");
+    health.startup_state = Trim(ExtractJsonFieldString(startup_json, "state"));
+    health.startup_message = Trim(ExtractJsonFieldString(startup_json, "message"));
+    if (health.summary.empty()) {
+        health.summary = health.startup_message;
+    }
+    if (!startup_json.empty()) {
+        health.progress = ExtractJsonFieldDouble(startup_json, "progress", health.progress);
+        const std::string modalities_json = ExtractJsonFieldObject(startup_json, "modalities");
+        for (const std::string modality_name : {"stt", "vision", "gesture"}) {
+            const std::string modality_json = ExtractJsonFieldObject(modalities_json, modality_name);
+            const std::string modality_error = Trim(ExtractJsonFieldString(modality_json, "error"));
+            if (!modality_error.empty()) {
+                health.modality_errors[modality_name] = modality_error;
+            }
+        }
+    }
+    for (const auto& [name, error] : ExtractJsonStringMap(body, "modality_errors")) {
+        const std::string trimmed_name = Trim(name);
+        const std::string trimmed_error = Trim(error);
+        if (!trimmed_name.empty() && !trimmed_error.empty()) {
+            health.modality_errors[trimmed_name] = trimmed_error;
+        }
+    }
+    for (const std::string modality_name : {"stt", "vision", "gesture"}) {
+        const auto it = health.modality_errors.find(modality_name);
+        if (it != health.modality_errors.end() && !it->second.empty()) {
+            health.top_startup_error = it->second;
+            break;
+        }
+    }
+    if (health.top_startup_error.empty()) {
+        health.top_startup_error = !health.startup_message.empty() ? health.startup_message : health.summary;
+    }
     health.planner_mode = Trim(ExtractJsonFieldString(body, "planner_mode"));
     if (health.planner_mode.empty()) {
         health.planner_mode = "llm";
@@ -3114,6 +3197,38 @@ class MainWindow : public QMainWindow {
     bool StartupFailed() const { return startup_failed_; }
 
    private:
+    void MaybePublishSidecarStartupError(const std::string& error_text) {
+        const std::string trimmed = Trim(error_text);
+        if (trimmed.empty()) {
+            return;
+        }
+        sidecar_startup_error_ = trimmed;
+        const auto now = std::chrono::steady_clock::now();
+        const bool unchanged = trimmed == last_reported_sidecar_error_;
+        const bool cooldown_active =
+            unchanged && last_reported_sidecar_error_at_.has_value() &&
+            now - *last_reported_sidecar_error_at_ < std::chrono::seconds(20);
+        if (cooldown_active) {
+            return;
+        }
+        last_reported_sidecar_error_ = trimmed;
+        last_reported_sidecar_error_at_ = now;
+        const std::string message = "Sidecar startup issue: " + trimmed;
+        AppendChat("system", message);
+        Log(message);
+        statusBar()->showMessage(QString::fromStdString(message), 6000);
+    }
+
+    void UpdateSidecarHealthIssue(const SidecarHealthStatus& health) {
+        sidecar_health_ready_ = health.ready;
+        if (health.ready) {
+            sidecar_startup_error_.clear();
+            return;
+        }
+        const std::string detail = !health.top_startup_error.empty() ? health.top_startup_error : health.summary;
+        MaybePublishSidecarStartupError(detail.empty() ? "sidecar_not_ready" : detail);
+    }
+
     void InitializeSidecarWithProgress() {
         app_config_path_ = DefaultAppConfigPath();
         app_config_ = LoadAppConfig(app_config_path_);
@@ -3133,6 +3248,27 @@ class MainWindow : public QMainWindow {
         SetEnvVar("MIMOCA_LLM_PROVIDER", app_config_.planner_provider);
         SetEnvVar("MIMOCA_LLM_BASE_URL", app_config_.llm_base_url);
         SetEnvVar("MIMOCA_LLM_MODEL", app_config_.llm_model);
+        if (!app_config_.cache_root.empty()) {
+            SetEnvVar("MIMOCA_MODEL_CACHE_ROOT", app_config_.cache_root);
+        }
+        const std::string stt_cache = !app_config_.stt_cache_root.empty()
+                                          ? app_config_.stt_cache_root
+                                          : CachePathOrDefault(app_config_.cache_root, "stt");
+        const std::string vision_cache = !app_config_.vision_cache_root.empty()
+                                             ? app_config_.vision_cache_root
+                                             : CachePathOrDefault(app_config_.cache_root, "vision");
+        const std::string gesture_cache = !app_config_.gesture_cache_root.empty()
+                                              ? app_config_.gesture_cache_root
+                                              : CachePathOrDefault(app_config_.cache_root, "gesture");
+        if (!stt_cache.empty()) {
+            SetEnvVar("MIMOCA_STT_CACHE_ROOT", stt_cache);
+        }
+        if (!vision_cache.empty()) {
+            SetEnvVar("MIMOCA_VISION_CACHE_ROOT", vision_cache);
+        }
+        if (!gesture_cache.empty()) {
+            SetEnvVar("MIMOCA_GESTURE_CACHE_ROOT", gesture_cache);
+        }
 
         PythonSidecarManager::StartOptions options;
         options.host = sidecar_host_;
@@ -3153,7 +3289,7 @@ class MainWindow : public QMainWindow {
             sidecar_ok_ = false;
             const std::string message =
                 "Could not prepare Python sidecar environment. Open Settings or installer repair and retry sidecar setup.";
-            AppendChat("system", message);
+            MaybePublishSidecarStartupError(message);
             sidecar_status_->setText("sidecar: setup failed");
             return;
         }
@@ -3173,10 +3309,12 @@ class MainWindow : public QMainWindow {
                 AppendChat("system", "Microphone capture unavailable. Voice turn automation is disabled.");
             }
         }
+        const SidecarHealthStatus startup_health = QueryPythonHealth(sidecar_host_, sidecar_port_);
+        UpdateSidecarHealthIssue(startup_health);
         if (sidecar_manager_.runtime_missing()) {
-            AppendChat("system",
-                       "Speech/vision sidecar unavailable: Python runtime not found. Install Python 3.11+ and set "
-                       "MIMOCA_PYTHON_EXECUTABLE.");
+            MaybePublishSidecarStartupError(
+                "Speech/vision sidecar unavailable: Python runtime not found. Install Python 3.11+ and set "
+                "MIMOCA_PYTHON_EXECUTABLE.");
         }
         statusBar()->clearMessage();
     }
@@ -3585,13 +3723,20 @@ class MainWindow : public QMainWindow {
         }
         if (sidecar_ok_) {
             const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
+            UpdateSidecarHealthIssue(health);
             planner_mode_ = health.planner_mode;
             planner_llm_configured_ = health.planner_llm_configured;
             planner_fallback_active_ = health.planner_fallback_active;
         } else {
+            sidecar_health_ready_ = false;
+            const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
+            if (health.reachable) {
+                UpdateSidecarHealthIssue(health);
+            }
             planner_fallback_active_ = true;
         }
         if (!sidecar_ok_ && sidecar_manager_.runtime_missing()) {
+            MaybePublishSidecarStartupError("python runtime missing (see log)");
             sidecar_status_->setText("sidecar: python runtime missing (see log)");
         }
         MaybeProcessGestureIntent();
@@ -3806,7 +3951,18 @@ class MainWindow : public QMainWindow {
             planner_label += planner_ready_ ? "mock ready" : "mock";
         }
         planner_status_->setText(planner_label.c_str());
-        sidecar_status_->setText(std::string("sidecar: ").append(sidecar_ok_ ? "healthy" : "offline").c_str());
+        std::string sidecar_label = "sidecar: ";
+        if (!sidecar_ok_) {
+            sidecar_label += "offline";
+        } else if (!sidecar_health_ready_) {
+            sidecar_label += "starting";
+        } else {
+            sidecar_label += "healthy";
+        }
+        if (!sidecar_startup_error_.empty()) {
+            sidecar_label += " - " + sidecar_startup_error_;
+        }
+        sidecar_status_->setText(sidecar_label.c_str());
     }
 
     void AppendChat(const std::string& speaker, const std::string& text) {
@@ -3859,6 +4015,10 @@ class MainWindow : public QMainWindow {
     bool planner_llm_configured_ = false;
     bool planner_fallback_active_ = false;
     std::string planner_mode_ = "llm";
+    bool sidecar_health_ready_ = false;
+    std::string sidecar_startup_error_;
+    std::string last_reported_sidecar_error_;
+    std::optional<std::chrono::steady_clock::time_point> last_reported_sidecar_error_at_;
 
     RecipeState recipe_state_{};
     AppConfig app_config_{};
