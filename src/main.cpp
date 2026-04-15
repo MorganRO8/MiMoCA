@@ -3256,6 +3256,7 @@ class MainWindow : public QMainWindow {
     }
 
     void UpdateSidecarHealthIssue(const SidecarHealthStatus& health) {
+        latest_sidecar_health_ = health;
         sidecar_health_ready_ = health.startup_ready;
         if (!health.reachable || !health.alive) {
             const std::string detail = !health.top_startup_error.empty() ? health.top_startup_error : "sidecar_unreachable";
@@ -3992,6 +3993,18 @@ class MainWindow : public QMainWindow {
         std::string mic_label = "mic: ";
         if (!sidecar_ok_) {
             mic_label += "offline";
+        } else if (const auto it = latest_sidecar_health_.modalities.find("stt");
+                   it != latest_sidecar_health_.modalities.end() && it->second.status != "ready") {
+            const auto& stt = it->second;
+            if (stt.status == "downloading") {
+                mic_label += "downloading model";
+            } else if (stt.status == "failed") {
+                mic_label += "error";
+            } else if (stt.status == "disabled") {
+                mic_label += "disabled";
+            } else {
+                mic_label += "initializing";
+            }
         } else if (!app_config_.speech_enabled) {
             mic_label += "disabled";
         } else if (!vad_available_) {
@@ -4003,7 +4016,25 @@ class MainWindow : public QMainWindow {
         }
         mic_status_->setText(mic_label.c_str());
         tts_status_->setText(std::string("tts: ").append(tts_.IsSpeaking() ? "speaking" : "idle").c_str());
-        std::string gesture_label = "gesture: " + (app_config_.gesture_enabled ? gesture_status_text_ : "disabled");
+        std::string gesture_label = "gesture: ";
+        if (!sidecar_ok_) {
+            gesture_label += "offline";
+        } else if (!app_config_.gesture_enabled) {
+            gesture_label += "disabled";
+        } else if (const auto it = latest_sidecar_health_.modalities.find("gesture");
+                   it != latest_sidecar_health_.modalities.end() && it->second.status != "ready") {
+            if (it->second.status == "downloading") {
+                gesture_label += "initializing";
+            } else if (it->second.status == "failed") {
+                gesture_label += "error";
+            } else if (it->second.status == "disabled") {
+                gesture_label += "disabled";
+            } else {
+                gesture_label += "initializing";
+            }
+        } else {
+            gesture_label += gesture_status_text_;
+        }
         if (gesture_active_) {
             gesture_label += " (active)";
         }
@@ -4086,6 +4117,7 @@ class MainWindow : public QMainWindow {
     bool planner_fallback_active_ = false;
     std::string planner_mode_ = "llm";
     bool sidecar_health_ready_ = false;
+    SidecarHealthStatus latest_sidecar_health_{};
     std::string sidecar_startup_error_;
     std::string last_reported_sidecar_error_;
     std::optional<std::chrono::steady_clock::time_point> last_reported_sidecar_error_at_;
