@@ -64,6 +64,24 @@ set(MIMOCA_RELEASE_LAYOUT_ROOT "MiMoCA")
 set(MIMOCA_MANAGED_PYTHON_RUNTIME "" CACHE PATH "Path to a managed Python runtime to package under runtime/python")
 
 install(TARGETS mimoca RUNTIME DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/bin)
+if(WIN32)
+  install(CODE [[
+    file(GET_RUNTIME_DEPENDENCIES
+      EXECUTABLES "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/MiMoCA/bin/mimoca.exe"
+      RESOLVED_DEPENDENCIES_VAR mimoca_resolved_deps
+      UNRESOLVED_DEPENDENCIES_VAR mimoca_unresolved_deps
+      PRE_EXCLUDE_REGEXES "api-ms-" "ext-ms-"
+      POST_EXCLUDE_REGEXES
+        ".*[Ww]indows[/\\\\]System32/.*\\.dll"
+        ".*[Ww]indows[/\\\\]SysWOW64/.*\\.dll")
+    foreach(dep IN LISTS mimoca_resolved_deps)
+      file(INSTALL DESTINATION "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/MiMoCA/bin" TYPE SHARED_LIBRARY FILES "${dep}")
+    endforeach()
+    if(mimoca_unresolved_deps)
+      message(WARNING "Unresolved runtime dependencies during install: ${mimoca_unresolved_deps}")
+    endif()
+  ]])
+endif()
 install(DIRECTORY assets/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/assets)
 install(DIRECTORY python/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/python)
 install(DIRECTORY scripts/ DESTINATION ${MIMOCA_RELEASE_LAYOUT_ROOT}/scripts)

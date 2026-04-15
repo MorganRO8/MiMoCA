@@ -84,6 +84,22 @@ def _installer_points_to_release(repo: pathlib.Path) -> CheckResult:
     return CheckResult("installer_script", ok, detail)
 
 
+def _installer_bootstrap_entrypoint(repo: pathlib.Path) -> CheckResult:
+    iss_path = repo / "installer" / "mimoca.iss"
+    if not iss_path.exists():
+        return CheckResult("installer_bootstrap_entrypoint", False, f"Missing file: {iss_path}")
+    text = iss_path.read_text(encoding="utf-8")
+    uses_powershell = '{sys}\\WindowsPowerShell\\v1.0\\powershell.exe' in text
+    invokes_setup_script = 'first_launch_setup.ps1' in text
+    if uses_powershell and invokes_setup_script:
+        return CheckResult("installer_bootstrap_entrypoint", True, "installer runs first-launch setup via powershell.exe")
+    return CheckResult(
+        "installer_bootstrap_entrypoint",
+        False,
+        "installer must invoke first_launch_setup.ps1 through powershell.exe",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run MiMoCA release smoke checks")
     parser.add_argument("--repo", default=".", help="Repository root")
@@ -119,6 +135,7 @@ def main() -> int:
     if checks[-1].ok:
         checks.append(_staged_layout(stage_dir))
     checks.append(_installer_points_to_release(repo))
+    checks.append(_installer_bootstrap_entrypoint(repo))
 
     overall_ok = all(item.ok for item in checks)
     report = {
