@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -1416,13 +1417,24 @@ bool SendHttpRequest(const std::string& host, int port, const std::string& reque
 }
 
 struct SidecarHealthStatus {
+    struct ModalityStatus {
+        std::string status;
+        double progress = 0.0;
+        std::string message;
+        std::string error;
+    };
+
     bool reachable = false;
-    bool ready = false;
+    bool alive = false;
+    bool startup_ready = false;
+    bool ready_for_turns = false;
     std::string summary;
+    std::string app_ready_mode;
     std::string startup_state;
     std::string startup_message;
     double progress = 0.0;
     std::string body;
+    std::unordered_map<std::string, ModalityStatus> modalities;
     std::unordered_map<std::string, std::string> modality_errors;
     std::string top_startup_error;
     std::string planner_mode = "llm";
@@ -1447,7 +1459,10 @@ SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
     const bool http_ok = response.find("200 OK") != std::string::npos;
     const std::string body = ExtractHttpBody(response);
     health.reachable = response.find("HTTP/1.1") != std::string::npos;
-    health.ready = http_ok && ExtractJsonFieldBool(body, "startup_ready", true);
+    health.alive = http_ok && ExtractJsonFieldBool(ExtractJsonFieldObject(body, "transport"), "live", true);
+    health.startup_ready = ExtractJsonFieldBool(body, "startup_ready", false);
+    health.ready_for_turns = ExtractJsonFieldBool(body, "ready_for_turns", health.alive);
+    health.app_ready_mode = Trim(ExtractJsonFieldString(body, "app_ready_mode"));
     health.summary = Trim(ExtractJsonFieldString(body, "startup_summary"));
     health.progress = ExtractJsonFieldDouble(body, "progress", 0.0);
     health.body = body;
@@ -1462,7 +1477,13 @@ SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
         const std::string modalities_json = ExtractJsonFieldObject(startup_json, "modalities");
         for (const std::string modality_name : {"stt", "vision", "gesture"}) {
             const std::string modality_json = ExtractJsonFieldObject(modalities_json, modality_name);
+            SidecarHealthStatus::ModalityStatus modality_status{};
+            modality_status.status = Trim(ExtractJsonFieldString(modality_json, "status"));
+            modality_status.progress = ExtractJsonFieldDouble(modality_json, "progress", 0.0);
+            modality_status.message = Trim(ExtractJsonFieldString(modality_json, "message"));
             const std::string modality_error = Trim(ExtractJsonFieldString(modality_json, "error"));
+            modality_status.error = modality_error;
+            health.modalities[modality_name] = modality_status;
             if (!modality_error.empty()) {
                 health.modality_errors[modality_name] = modality_error;
             }
@@ -1492,10 +1513,10 @@ SidecarHealthStatus QueryPythonHealth(const std::string& host, int port) {
     health.planner_llm_configured = ExtractJsonFieldBool(body, "planner_llm_configured", false);
     health.planner_llm_ready = ExtractJsonFieldBool(body, "planner_llm_ready", false);
     health.planner_fallback_active = ExtractJsonFieldBool(body, "planner_fallback_active", false);
-    if (health.ready) {
+    if (health.alive) {
         Log("Python sidecar health check succeeded.");
     } else {
-        Log("Python sidecar health check not ready yet.");
+        Log("Python sidecar health check unreachable.");
     }
     Log("Sidecar response preview: " + response.substr(0, std::min<size_t>(response.size(), 180)));
     return health;
@@ -1521,9 +1542,13 @@ class PythonSidecarManager {
 
         progress_callback("Initializing speech/vision services…");
         const SidecarHealthStatus initial_health = QueryPythonHealth(options.host, options.port);
-        if (initial_health.ready) {
+        if (initial_health.alive) {
             ready_ = true;
-            progress_callback("Speech/vision services ready.");
+            if (initial_health.startup_ready) {
+                progress_callback("Speech/vision services ready.");
+            } else {
+                progress_callback("Speech/vision sidecar online; models still initializing.");
+            }
             return true;
         }
 
@@ -1545,15 +1570,24 @@ class PythonSidecarManager {
                 message += " " + health.summary;
             }
             progress_callback(message);
-            if (health.ready) {
+            if (health.alive) {
                 ready_ = true;
-                progress_callback("Speech/vision services ready.");
+                if (health.startup_ready) {
+                    progress_callback("Speech/vision services ready.");
+                } else {
+                    progress_callback("Speech/vision sidecar online; modalities still downloading.");
+                }
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(options.startup_retry_delay_ms));
         }
 
-        ready_ = false;
+        const SidecarHealthStatus post_window_health = QueryPythonHealth(options.host, options.port);
+        ready_ = post_window_health.alive;
+        if (ready_) {
+            progress_callback("Speech/vision sidecar online; initialization continuing in background.");
+            return true;
+        }
         progress_callback("Speech/vision services are offline; using recipe-only fallback.");
         return false;
     }
@@ -1564,11 +1598,13 @@ class PythonSidecarManager {
             return false;
         }
         if (IsManagedProcessAlive()) {
-            ready_ = QueryPythonHealth(options_.host, options_.port).ready;
+            const SidecarHealthStatus health = QueryPythonHealth(options_.host, options_.port);
+            ready_ = health.alive || health.reachable;
             return ready_;
         }
         if (!is_spawned_) {
-            ready_ = QueryPythonHealth(options_.host, options_.port).ready;
+            const SidecarHealthStatus health = QueryPythonHealth(options_.host, options_.port);
+            ready_ = health.alive || health.reachable;
             return ready_;
         }
 
@@ -3220,13 +3256,47 @@ class MainWindow : public QMainWindow {
     }
 
     void UpdateSidecarHealthIssue(const SidecarHealthStatus& health) {
-        sidecar_health_ready_ = health.ready;
-        if (health.ready) {
+        sidecar_health_ready_ = health.startup_ready;
+        if (!health.reachable || !health.alive) {
+            const std::string detail = !health.top_startup_error.empty() ? health.top_startup_error : "sidecar_unreachable";
+            MaybePublishSidecarStartupError(detail);
+            return;
+        }
+        if (health.startup_ready) {
             sidecar_startup_error_.clear();
             return;
         }
-        const std::string detail = !health.top_startup_error.empty() ? health.top_startup_error : health.summary;
-        MaybePublishSidecarStartupError(detail.empty() ? "sidecar_not_ready" : detail);
+
+        std::ostringstream progress;
+        progress << "initializing";
+        if (!health.startup_state.empty()) {
+            progress << " (" << health.startup_state << ")";
+        }
+        progress << " " << std::fixed << std::setprecision(0) << std::clamp(health.progress, 0.0, 1.0) * 100.0 << "%";
+        for (const std::string modality_name : {"stt", "vision", "gesture"}) {
+            const auto it = health.modalities.find(modality_name);
+            if (it == health.modalities.end()) {
+                continue;
+            }
+            const auto& modality = it->second;
+            progress << " | " << modality_name << ":";
+            if (!modality.status.empty()) {
+                progress << modality.status;
+            } else {
+                progress << "unknown";
+            }
+            progress << " " << std::fixed << std::setprecision(0) << std::clamp(modality.progress, 0.0, 1.0) * 100.0 << "%";
+        }
+        sidecar_startup_error_ = progress.str();
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!last_reported_sidecar_error_at_.has_value() ||
+            now - *last_reported_sidecar_error_at_ >= std::chrono::seconds(30)) {
+            last_reported_sidecar_error_at_ = now;
+            const std::string message = "Sidecar online, " + sidecar_startup_error_;
+            AppendChat("system", message);
+            Log(message);
+        }
     }
 
     void InitializeSidecarWithProgress() {
