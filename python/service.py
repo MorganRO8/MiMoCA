@@ -1458,14 +1458,36 @@ def _planner_with_fallback(turn_context: dict) -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     _health_log_counter = 0
+    _DISCONNECT_WINERRORS = {10053, 10054}
+    _DISCONNECT_ERRNOS = {32, 104}
+
+    class ClientDisconnected(Exception):
+        """Request ended because client disconnected before response write completed."""
+
+    @classmethod
+    def _is_disconnect_error(cls, exc: BaseException) -> bool:
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return True
+        if isinstance(exc, OSError):
+            if getattr(exc, "winerror", None) in cls._DISCONNECT_WINERRORS:
+                return True
+            if getattr(exc, "errno", None) in cls._DISCONNECT_ERRNOS:
+                return True
+        return False
 
     def _write_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:  # noqa: BLE001
+            if self._is_disconnect_error(exc):
+                logging.debug("client disconnected during response write: path=%s status=%d", self.path, status)
+                raise Handler.ClientDisconnected() from exc
+            raise
 
     def log_message(self, fmt: str, *args) -> None:
         rendered = fmt % args
@@ -1493,6 +1515,12 @@ class Handler(BaseHTTPRequestHandler):
         return str(modality_info.get("status", "")).strip().lower() == "ready"
 
     def do_GET(self) -> None:
+        try:
+            self._do_GET_impl()
+        except Handler.ClientDisconnected:
+            return
+
+    def _do_GET_impl(self) -> None:
         if self.path == "/health":
             Handler._health_log_counter += 1
             if Handler._health_log_counter % 30 == 1:
@@ -1552,6 +1580,12 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(404, {"error": "not_found", "path": self.path})
 
     def do_POST(self) -> None:
+        try:
+            self._do_POST_impl()
+        except Handler.ClientDisconnected:
+            return
+
+    def _do_POST_impl(self) -> None:
         logging.info("request POST %s", self.path)
         content_length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
@@ -1648,9 +1682,14 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._write_json(400, {"error": str(exc)})
             return
+        except Handler.ClientDisconnected:
+            return
         except Exception as exc:  # noqa: BLE001
             logging.exception("sidecar endpoint failure: %s", exc)
-            self._write_json(500, {"error": "sidecar_failure", "detail": str(exc)})
+            try:
+                self._write_json(500, {"error": "sidecar_failure", "detail": str(exc)})
+            except Handler.ClientDisconnected:
+                return
             return
 
         self._write_json(404, {"error": "not_found", "path": self.path})
