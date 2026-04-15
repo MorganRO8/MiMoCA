@@ -60,6 +60,14 @@ Branch selection example:
 | Camera unavailable | Camera already in use, blocked permission, or missing OpenCV/device access | Close other camera apps, confirm Windows camera permission, then relaunch. MiMoCA should still run voice/planner flow without camera. |
 | API key missing / planner not ready | `llm` mode selected but key not set/invalid | Enter key in planner settings prompt, or run mock mode for now (`MIMOCA_PLANNER_MODE=mock`). |
 | Model download failure on first run | Network/proxy issue, blocked host, or interrupted bootstrap | Retry from app prompt, verify internet/proxy settings, and relaunch. Cached models live under `%LOCALAPPDATA%\MiMoCA\model_cache`. |
+| Setup/bootstrap reports access denied under `Program Files` or cache path | App launched with a different Windows user than the one that installed/initialized sidecar data, or stale ACLs on `%LOCALAPPDATA%\MiMoCA` | Re-run using the same Windows account that installed MiMoCA, then clear/recreate `%LOCALAPPDATA%\MiMoCA\logs`, `%LOCALAPPDATA%\MiMoCA\sidecar_venv`, and `%LOCALAPPDATA%\MiMoCA\model_cache` if needed. |
+
+### Installer/runtime ownership model (Windows)
+
+- MiMoCA now installs in **per-user mode** by default (`%LOCALAPPDATA%\Programs\MiMoCA`) and runs first-launch setup in that same user context.
+- Runtime sidecar state is also per-user and stored under `%LOCALAPPDATA%\MiMoCA\...` (logs, venv, cache, temp, app data).
+- Uninstall cleanup targets the **current user profile** local-data folders, and prompts before removing model cache.
+- If you run MiMoCA as a different Windows user than the installer user, expect missing-cache/bootstrap re-initialization and possible permission mismatches until that user's local data is initialized.
 
 ---
 
