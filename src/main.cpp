@@ -2582,11 +2582,40 @@ class WasapiMicCapture {
 
     bool running() const { return running_; }
     int sample_rate_hz() const { return sample_rate_hz_; }
+    std::string last_failure_reason() const {
+        std::lock_guard<std::mutex> lock(error_mutex_);
+        return last_failure_reason_;
+    }
 
    private:
+    static std::string HrHex(const HRESULT hr) {
+        std::ostringstream oss;
+        oss << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0')
+            << static_cast<unsigned long>(hr);
+        return oss.str();
+    }
+
+    void ReportFailure(const std::string& stage, const HRESULT hr, const std::string& message) {
+        const std::string hr_hex = HrHex(hr);
+        const std::string reason = "WASAPI " + stage + " failed (" + hr_hex + ")";
+        {
+            std::lock_guard<std::mutex> lock(error_mutex_);
+            last_failure_reason_ = reason;
+        }
+        Log("WASAPI capture unavailable: " + message + " (hr=" + hr_hex + ").");
+    }
+
     void CaptureLoop() {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+            ReportFailure("CoInitializeEx", hr, "COM initialization failed");
+            return;
+        }
         const bool uninit = SUCCEEDED(hr);
+        {
+            std::lock_guard<std::mutex> lock(error_mutex_);
+            last_failure_reason_.clear();
+        }
 
         IMMDeviceEnumerator* enumerator = nullptr;
         IMMDevice* device = nullptr;
@@ -2622,7 +2651,7 @@ class WasapiMicCapture {
         hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
                               reinterpret_cast<void**>(&enumerator));
         if (FAILED(hr) || enumerator == nullptr) {
-            Log("WASAPI capture unavailable: cannot create MMDeviceEnumerator.");
+            ReportFailure("CoCreateInstance(MMDeviceEnumerator)", hr, "cannot create MMDeviceEnumerator");
             cleanup();
             return;
         }
@@ -2634,7 +2663,7 @@ class WasapiMicCapture {
         }
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&audio_client));
         if (FAILED(hr) || audio_client == nullptr) {
-            Log("WASAPI capture unavailable: failed to activate audio client.");
+            ReportFailure("IMMDevice::Activate(IAudioClient)", hr, "failed to activate audio client");
             cleanup();
             return;
         }
@@ -2660,7 +2689,7 @@ class WasapiMicCapture {
                                       mix_format,
                                       nullptr);
         if (FAILED(hr)) {
-            Log("WASAPI capture unavailable: audio client initialize failed.");
+            ReportFailure("IAudioClient::Initialize", hr, "audio client initialize failed");
             cleanup();
             return;
         }
@@ -2678,7 +2707,7 @@ class WasapiMicCapture {
         }
         hr = audio_client->Start();
         if (FAILED(hr)) {
-            Log("WASAPI capture unavailable: could not start capture.");
+            ReportFailure("IAudioClient::Start", hr, "could not start capture");
             cleanup();
             return;
         }
@@ -2774,6 +2803,8 @@ class WasapiMicCapture {
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> running_{false};
+    mutable std::mutex error_mutex_;
+    std::string last_failure_reason_;
     std::thread capture_thread_;
     ChunkCallback callback_;
     int sample_rate_hz_ = 16000;
@@ -2819,9 +2850,18 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
                 }
             });
             if (!started) {
-                Log("WASAPI microphone capture unavailable; speech turns disabled.");
+                const std::string reason = Trim(mic_capture_.last_failure_reason());
+                {
+                    std::lock_guard<std::mutex> lock(mic_reason_mutex_);
+                    mic_status_reason_ = reason.empty() ? "WASAPI capture unavailable" : reason;
+                }
+                Log("WASAPI microphone capture unavailable; speech turns disabled. reason=" + MicrophoneStatusHint());
                 return false;
             }
+        }
+        {
+            std::lock_guard<std::mutex> lock(mic_reason_mutex_);
+            mic_status_reason_.clear();
         }
 
         if (session_id_.empty()) {
@@ -2862,6 +2902,11 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
 
     bool vad_available() const {
         return vad_available_;
+    }
+
+    std::string MicrophoneStatusHint() const {
+        std::lock_guard<std::mutex> lock(mic_reason_mutex_);
+        return mic_status_reason_;
     }
 
     bool TryConsumeConsoleLine(const std::string& line, TranscriptEvent& out_event) override {
@@ -3031,6 +3076,8 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
     bool pending_speech_start_event_ = false;
     bool speech_active_ = false;
     bool vad_available_ = true;
+    mutable std::mutex mic_reason_mutex_;
+    std::string mic_status_reason_;
     std::optional<std::chrono::steady_clock::time_point> last_speech_start_at_;
     WasapiMicCapture mic_capture_;
 };
@@ -3268,14 +3315,55 @@ class MainWindow : public QMainWindow {
         statusBar()->showMessage(QString::fromStdString(message), 6000);
     }
 
+    bool IsModalityRequired(const std::string& modality_name) const {
+        if (modality_name == "stt") {
+            return app_config_.speech_enabled;
+        }
+        if (modality_name == "vision") {
+            return app_config_.vision_enabled;
+        }
+        if (modality_name == "gesture") {
+            return app_config_.gesture_enabled;
+        }
+        return false;
+    }
+
+    std::string RequiredModalityFailure(const SidecarHealthStatus& health) const {
+        for (const std::string modality_name : {"stt", "vision", "gesture"}) {
+            if (!IsModalityRequired(modality_name)) {
+                continue;
+            }
+            const auto error_it = health.modality_errors.find(modality_name);
+            if (error_it != health.modality_errors.end() && !Trim(error_it->second).empty()) {
+                return modality_name + " failed: " + Trim(error_it->second);
+            }
+            const auto modality_it = health.modalities.find(modality_name);
+            if (modality_it != health.modalities.end() && modality_it->second.status == "failed") {
+                const std::string detail = Trim(modality_it->second.error);
+                if (!detail.empty()) {
+                    return modality_name + " failed: " + detail;
+                }
+                return modality_name + " failed";
+            }
+        }
+        return "";
+    }
+
     void UpdateSidecarHealthIssue(const SidecarHealthStatus& health) {
         latest_sidecar_health_ = health;
-        sidecar_health_ready_ = health.startup_ready;
+        sidecar_health_ready_ = health.ready_for_turns;
         if (!health.reachable || !health.alive) {
-            const std::string detail = !health.top_startup_error.empty() ? health.top_startup_error : "sidecar_unreachable";
-            MaybePublishSidecarStartupError(detail);
+            ++sidecar_transport_failure_streak_;
+            std::ostringstream detail;
+            detail << "sidecar unreachable";
+            if (sidecar_transport_failure_streak_ >= 3) {
+                detail << " (transport failures: " << sidecar_transport_failure_streak_ << ")";
+            }
+            MaybePublishSidecarStartupError(detail.str());
             return;
         }
+        sidecar_transport_failure_streak_ = 0;
+
         if (health.startup_ready) {
             sidecar_startup_error_.clear();
             if (app_config_.warmup_status != "completed") {
@@ -3283,8 +3371,19 @@ class MainWindow : public QMainWindow {
                 app_config_.warmup_message = "core models initialized";
                 SaveAppConfig(app_config_path_, app_config_);
             }
+        }
+
+        if (health.ready_for_turns) {
+            sidecar_startup_error_.clear();
             return;
         }
+
+        const std::string required_failure = RequiredModalityFailure(health);
+        if (!required_failure.empty()) {
+            MaybePublishSidecarStartupError(required_failure);
+            return;
+        }
+
         if (app_config_.warmup_status == "unknown") {
             app_config_.warmup_status = "downloading";
             app_config_.warmup_message = "models still downloading";
@@ -3321,15 +3420,6 @@ class MainWindow : public QMainWindow {
         if (changed) {
             sidecar_startup_error_ = progress_text;
             last_sidecar_startup_signature_ = signature_text;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (changed && (!last_reported_sidecar_error_at_.has_value() ||
-            now - *last_reported_sidecar_error_at_ >= std::chrono::seconds(30))) {
-            last_reported_sidecar_error_at_ = now;
-            const std::string message = "Sidecar online, " + progress_text;
-            AppendChat("system", message);
-            Log(message);
         }
     }
 
@@ -4040,6 +4130,7 @@ class MainWindow : public QMainWindow {
             last_speech_start_at_.has_value() &&
             now - *last_speech_start_at_ < std::chrono::milliseconds(kSpeechStartIndicatorHoldMs);
         std::string mic_label = "mic: ";
+        const std::string mic_hint = Trim(speech_input_.MicrophoneStatusHint());
         if (!sidecar_ok_) {
             mic_label += "offline";
         } else if (const auto it = latest_sidecar_health_.modalities.find("stt");
@@ -4056,6 +4147,9 @@ class MainWindow : public QMainWindow {
             }
         } else if (!app_config_.speech_enabled) {
             mic_label += "disabled";
+        } else if (!mic_hint.empty()) {
+            mic_label += "error";
+            mic_label += " (" + mic_hint + ")";
         } else if (!vad_available_) {
             mic_label += "listening (manual stop fallback)";
         } else if (speech_started_recently) {
@@ -4109,10 +4203,15 @@ class MainWindow : public QMainWindow {
             } else {
                 sidecar_label += "offline";
             }
-        } else if (!sidecar_health_ready_) {
-            sidecar_label += "starting";
         } else {
-            sidecar_label += "healthy";
+            const std::string ready_mode = ToLower(Trim(latest_sidecar_health_.app_ready_mode));
+            if (ready_mode == "full" || sidecar_health_ready_) {
+                sidecar_label += "operational";
+            } else if (ready_mode == "degraded" || ready_mode == "core_only") {
+                sidecar_label += "operational (" + ready_mode + ")";
+            } else {
+                sidecar_label += "starting";
+            }
         }
         if (!sidecar_startup_error_.empty()) {
             sidecar_label += " - " + sidecar_startup_error_;
@@ -4174,6 +4273,7 @@ class MainWindow : public QMainWindow {
     SidecarHealthStatus latest_sidecar_health_{};
     std::string sidecar_startup_error_;
     std::string last_sidecar_startup_signature_;
+    int sidecar_transport_failure_streak_ = 0;
     std::optional<std::chrono::steady_clock::time_point> last_health_poll_at_;
     std::string last_startup_progress_message_;
     std::optional<std::chrono::steady_clock::time_point> last_startup_progress_at_;

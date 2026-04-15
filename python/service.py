@@ -1159,6 +1159,17 @@ class LlmPlannerAdapter:
             {"role": "user", "content": json.dumps(user_payload, separators=(",", ":"))},
         ]
 
+    @staticmethod
+    def _normalize_planner_contract_payload(payload: dict) -> dict:
+        planner_contract = payload.get("planner_contract")
+        if isinstance(planner_contract, dict):
+            logging.info("planner llm contract parse: wrapped planner_contract payload")
+            return _coerce_planner_response(planner_contract)
+        if "planner_contract" in payload:
+            logging.warning("planner llm contract parse: malformed planner_contract wrapper; using root fallback")
+        logging.info("planner llm contract parse: root payload")
+        return _coerce_planner_response(payload)
+
     def _invoke_openai_compatible(self, messages: list[dict]) -> dict:
         if not self.api_key:
             raise RuntimeError("llm_api_key_missing")
@@ -1212,11 +1223,39 @@ class LlmPlannerAdapter:
         )
         messages = self._build_messages(turn_context)
         if self.provider == "openai_compatible":
-            return _coerce_planner_response(self._invoke_openai_compatible(messages))
+            raw_response = self._invoke_openai_compatible(messages)
+            return self._normalize_planner_contract_payload(raw_response)
         raise RuntimeError(f"unsupported_llm_provider:{self.provider}")
 
 
+def _validate_planner_response_normalization() -> None:
+    root_payload = {
+        "assistant_text": "Root shape response.",
+        "speak": True,
+        "interruptible": True,
+        "advance_step": False,
+        "new_branch_id": None,
+        "ui_overlays": [],
+    }
+    wrapped_payload = {
+        "planner_contract": {
+            "assistant_text": "Wrapped shape response.",
+            "speak": False,
+            "interruptible": False,
+            "advance_step": True,
+            "new_branch_id": "pot",
+            "ui_overlays": [{"type": "highlight_label", "target": "pot"}],
+        }
+    }
+    normalized_root = LlmPlannerAdapter._normalize_planner_contract_payload(root_payload)
+    normalized_wrapped = LlmPlannerAdapter._normalize_planner_contract_payload(wrapped_payload)
+    assert normalized_root["assistant_text"] == "Root shape response."
+    assert normalized_wrapped["assistant_text"] == "Wrapped shape response."
+    assert normalized_wrapped["new_branch_id"] == "pot"
+
+
 PLANNER_ADAPTER = LlmPlannerAdapter()
+_validate_planner_response_normalization()
 PLANNER_RUNTIME_STATUS = {
     "fallback_active": False,
     "last_error": "",
