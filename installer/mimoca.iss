@@ -23,7 +23,7 @@ OutputDir=dist
 OutputBaseFilename=MiMoCA-Setup-{#MyAppVersion}
 
 [Files]
-Source: "release\MiMoCA\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "..\release\MiMoCA\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
