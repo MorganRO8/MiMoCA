@@ -21,6 +21,8 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
+#include <cmath>
 #include <vector>
 
 #ifdef MIMOCA_HAS_QT
@@ -61,6 +63,7 @@
 #include <sphelper.h>
 #else
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -252,6 +255,8 @@ struct AppConfig {
     std::string warmup_status = "unknown";
     std::string warmup_message;
     bool debug_overlay_enabled = false;
+    double gesture_confidence_threshold = 0.72;
+    int gesture_dwell_ms = 600;
 };
 
 struct SidecarBootstrapResult {
@@ -264,7 +269,11 @@ struct SidecarBootstrapResult {
 
 void Log(const std::string& message);
 std::string ReadFileText(const std::string& path);
-bool SendHttpRequest(const std::string& host, int port, const std::string& request, std::string& response_out);
+bool SendHttpRequest(const std::string& host,
+                     int port,
+                     const std::string& request,
+                     std::string& response_out,
+                     int timeout_ms = 5000);
 
 #ifdef _WIN32
 class TtsController {
@@ -843,6 +852,21 @@ bool ParseInt(const std::string& text, int& out_value) {
     return true;
 }
 
+bool ParseDouble(const std::string& text, double& out_value) {
+    const std::string trimmed = Trim(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+    const char* begin = trimmed.c_str();
+    char* end = nullptr;
+    const double parsed = std::strtod(begin, &end);
+    if (end == begin || (end != nullptr && *end != '\0') || !std::isfinite(parsed)) {
+        return false;
+    }
+    out_value = parsed;
+    return true;
+}
+
 std::string CachePathOrDefault(const std::string& root, const std::string& leaf) {
     if (root.empty()) {
         return "";
@@ -920,6 +944,15 @@ AppConfig LoadAppConfig(const std::string& path) {
 
     const std::string debug_json = ExtractJsonFieldObject(json, "debug");
     config.debug_overlay_enabled = ExtractJsonFieldBool(debug_json, "overlay_enabled", false);
+    const std::string gesture_json = ExtractJsonFieldObject(json, "gesture");
+    double parsed_gesture_confidence = config.gesture_confidence_threshold;
+    if (ParseDouble(ExtractJsonFieldString(gesture_json, "confidence_threshold"), parsed_gesture_confidence)) {
+        config.gesture_confidence_threshold = std::clamp(parsed_gesture_confidence, 0.5, 0.99);
+    }
+    int parsed_gesture_dwell_ms = config.gesture_dwell_ms;
+    if (ParseInt(ExtractJsonFieldString(gesture_json, "dwell_ms"), parsed_gesture_dwell_ms)) {
+        config.gesture_dwell_ms = std::clamp(parsed_gesture_dwell_ms, 200, 2000);
+    }
     const std::string warmup_json = ExtractJsonFieldObject(json, "warmup");
     config.warmup_status = ToLower(Trim(ExtractJsonFieldString(warmup_json, "status")));
     if (config.warmup_status.empty()) {
@@ -967,6 +1000,10 @@ bool SaveAppConfig(const std::string& path, const AppConfig& config) {
     output << "  },\n";
     output << "  \"debug\": {\n";
     output << "    \"overlay_enabled\": " << BoolJson(config.debug_overlay_enabled) << "\n";
+    output << "  },\n";
+    output << "  \"gesture\": {\n";
+    output << "    \"confidence_threshold\": \"" << config.gesture_confidence_threshold << "\",\n";
+    output << "    \"dwell_ms\": \"" << config.gesture_dwell_ms << "\"\n";
     output << "  },\n";
     output << "  \"warmup\": {\n";
     output << "    \"status\": \"" << EscapeJson(config.warmup_status) << "\",\n";
@@ -1023,6 +1060,12 @@ void ApplyEnvOverrides(AppConfig& config) {
     if (!debug_env.empty()) {
         config.debug_overlay_enabled = debug_env == "1" || debug_env == "true" || debug_env == "on";
     }
+    double env_gesture_confidence = config.gesture_confidence_threshold;
+    if (ParseDouble(EnvOrDefault("MIMOCA_GESTURE_CONFIDENCE_THRESHOLD", ""), env_gesture_confidence)) {
+        config.gesture_confidence_threshold = std::clamp(env_gesture_confidence, 0.5, 0.99);
+    }
+    const int env_gesture_dwell_ms = EnvIntOrDefault("MIMOCA_GESTURE_DWELL_MS", config.gesture_dwell_ms);
+    config.gesture_dwell_ms = std::clamp(env_gesture_dwell_ms, 200, 2000);
 }
 
 void LogEffectiveConfig(const AppConfig& config) {
@@ -1046,6 +1089,8 @@ void LogEffectiveConfig(const AppConfig& config) {
         << ",stt=" << config.stt_cache_root
         << ",vision=" << config.vision_cache_root
         << ",gesture=" << config.gesture_cache_root << "]"
+        << " gesture[confidence_threshold=" << config.gesture_confidence_threshold
+        << ",dwell_ms=" << config.gesture_dwell_ms << "]"
         << " warmup[status=" << config.warmup_status << "]"
         << " secrets[planner_api_key=redacted_secure_store]";
     Log(oss.str());
@@ -1345,7 +1390,11 @@ PlannerResponse ParsePlannerResponseBody(const std::string& body) {
     return response;
 }
 
-bool SendHttpRequest(const std::string& host, int port, const std::string& request, std::string& response_out) {
+bool SendHttpRequest(const std::string& host,
+                     int port,
+                     const std::string& request,
+                     std::string& response_out,
+                     const int timeout_ms) {
 #ifdef _WIN32
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
@@ -1354,37 +1403,62 @@ bool SendHttpRequest(const std::string& host, int port, const std::string& reque
     }
 #endif
 
-    int socket_fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
-    if (socket_fd < 0) {
-        Log("Failed to create socket.");
+    auto close_socket = [](int fd) {
 #ifdef _WIN32
-        WSACleanup();
-#endif
-        return false;
-    }
-
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(static_cast<uint16_t>(port));
-
-    if (::inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
-        Log("Invalid host address: " + host);
-#ifdef _WIN32
-        closesocket(socket_fd);
-        WSACleanup();
+        closesocket(fd);
 #else
-        close(socket_fd);
+        close(fd);
+#endif
+    };
+    auto apply_timeouts = [timeout_ms](int fd) {
+        if (timeout_ms <= 0) {
+            return;
+        }
+#ifdef _WIN32
+        const DWORD timeout_dw = static_cast<DWORD>(timeout_ms);
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_dw), sizeof(timeout_dw));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_dw), sizeof(timeout_dw));
+#else
+        const timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+    };
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* resolved = nullptr;
+    const std::string port_text = std::to_string(port);
+    if (::getaddrinfo(host.c_str(), port_text.c_str(), &hints, &resolved) != 0 || resolved == nullptr) {
+        Log("Could not resolve Python sidecar host: " + host);
+#ifdef _WIN32
+        WSACleanup();
 #endif
         return false;
     }
 
-    if (::connect(socket_fd, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+    int socket_fd = -1;
+    bool connected = false;
+    for (addrinfo* node = resolved; node != nullptr; node = node->ai_next) {
+        const int candidate_fd = static_cast<int>(::socket(node->ai_family, node->ai_socktype, node->ai_protocol));
+        if (candidate_fd < 0) {
+            continue;
+        }
+        apply_timeouts(candidate_fd);
+        if (::connect(candidate_fd, node->ai_addr, static_cast<int>(node->ai_addrlen)) == 0) {
+            socket_fd = candidate_fd;
+            connected = true;
+            break;
+        }
+        close_socket(candidate_fd);
+    }
+    ::freeaddrinfo(resolved);
+
+    if (!connected || socket_fd < 0) {
         Log("Could not connect to Python sidecar at http://" + host + ":" + std::to_string(port));
 #ifdef _WIN32
-        closesocket(socket_fd);
         WSACleanup();
-#else
-        close(socket_fd);
 #endif
         return false;
     }
@@ -1396,11 +1470,9 @@ bool SendHttpRequest(const std::string& host, int port, const std::string& reque
 #endif
     if (sent <= 0) {
         Log("Failed to send request to Python sidecar.");
+        close_socket(socket_fd);
 #ifdef _WIN32
-        closesocket(socket_fd);
         WSACleanup();
-#else
-        close(socket_fd);
 #endif
         return false;
     }
@@ -1419,11 +1491,9 @@ bool SendHttpRequest(const std::string& host, int port, const std::string& reque
         response_out.append(buffer, static_cast<size_t>(bytes_read));
     }
 
+    close_socket(socket_fd);
 #ifdef _WIN32
-    closesocket(socket_fd);
     WSACleanup();
-#else
-    close(socket_fd);
 #endif
 
     return !response_out.empty();
@@ -2075,7 +2145,7 @@ bool RequestMockPlanner(const std::string& host, int port, const TurnContext& tu
         std::to_string(body.size()) + "\r\n\r\n" + body;
 
     std::string response;
-    if (!SendHttpRequest(host, port, request, response)) {
+    if (!SendHttpRequest(host, port, request, response, 15000)) {
         return false;
     }
 
@@ -2334,7 +2404,8 @@ SttResult FinalizeStreamingSttSession(const std::string& host, int port, const s
 bool RequestGestureDetection(const std::string& host,
                              const int port,
                              const std::vector<uint8_t>& jpeg_bytes,
-                             Gesture& out_gesture) {
+                             Gesture& out_gesture,
+                             const int timeout_ms = 450) {
     if (jpeg_bytes.empty()) {
         return false;
     }
@@ -2350,7 +2421,7 @@ bool RequestGestureDetection(const std::string& host,
         std::to_string(body.size()) + "\r\n\r\n" + body;
 
     std::string response;
-    if (!SendHttpRequest(host, port, request, response)) {
+    if (!SendHttpRequest(host, port, request, response, timeout_ms)) {
         return false;
     }
     const std::string response_body = ExtractHttpBody(response);
@@ -2399,7 +2470,8 @@ std::vector<double> ParseNumberArray(const std::string& json_array) {
 bool RequestVisionDetections(const std::string& host,
                              const int port,
                              const std::vector<uint8_t>& jpeg_bytes,
-                             std::vector<Detection>& out_detections) {
+                             std::vector<Detection>& out_detections,
+                             const int timeout_ms = 550) {
     out_detections.clear();
     if (jpeg_bytes.empty()) {
         return false;
@@ -2416,7 +2488,7 @@ bool RequestVisionDetections(const std::string& host,
         std::to_string(body.size()) + "\r\n\r\n" + body;
 
     std::string response;
-    if (!SendHttpRequest(host, port, request, response)) {
+    if (!SendHttpRequest(host, port, request, response, timeout_ms)) {
         return false;
     }
     const std::string response_body = ExtractHttpBody(response);
@@ -2582,11 +2654,40 @@ class WasapiMicCapture {
 
     bool running() const { return running_; }
     int sample_rate_hz() const { return sample_rate_hz_; }
+    std::string last_failure_reason() const {
+        std::lock_guard<std::mutex> lock(error_mutex_);
+        return last_failure_reason_;
+    }
 
    private:
+    static std::string HrHex(const HRESULT hr) {
+        std::ostringstream oss;
+        oss << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0')
+            << static_cast<unsigned long>(hr);
+        return oss.str();
+    }
+
+    void ReportFailure(const std::string& stage, const HRESULT hr, const std::string& message) {
+        const std::string hr_hex = HrHex(hr);
+        const std::string reason = "WASAPI " + stage + " failed (" + hr_hex + ")";
+        {
+            std::lock_guard<std::mutex> lock(error_mutex_);
+            last_failure_reason_ = reason;
+        }
+        Log("WASAPI capture unavailable: " + message + " (hr=" + hr_hex + ").");
+    }
+
     void CaptureLoop() {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+            ReportFailure("CoInitializeEx", hr, "COM initialization failed");
+            return;
+        }
         const bool uninit = SUCCEEDED(hr);
+        {
+            std::lock_guard<std::mutex> lock(error_mutex_);
+            last_failure_reason_.clear();
+        }
 
         IMMDeviceEnumerator* enumerator = nullptr;
         IMMDevice* device = nullptr;
@@ -2622,7 +2723,7 @@ class WasapiMicCapture {
         hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
                               reinterpret_cast<void**>(&enumerator));
         if (FAILED(hr) || enumerator == nullptr) {
-            Log("WASAPI capture unavailable: cannot create MMDeviceEnumerator.");
+            ReportFailure("CoCreateInstance(MMDeviceEnumerator)", hr, "cannot create MMDeviceEnumerator");
             cleanup();
             return;
         }
@@ -2634,7 +2735,7 @@ class WasapiMicCapture {
         }
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&audio_client));
         if (FAILED(hr) || audio_client == nullptr) {
-            Log("WASAPI capture unavailable: failed to activate audio client.");
+            ReportFailure("IMMDevice::Activate(IAudioClient)", hr, "failed to activate audio client");
             cleanup();
             return;
         }
@@ -2660,7 +2761,7 @@ class WasapiMicCapture {
                                       mix_format,
                                       nullptr);
         if (FAILED(hr)) {
-            Log("WASAPI capture unavailable: audio client initialize failed.");
+            ReportFailure("IAudioClient::Initialize", hr, "audio client initialize failed");
             cleanup();
             return;
         }
@@ -2678,7 +2779,7 @@ class WasapiMicCapture {
         }
         hr = audio_client->Start();
         if (FAILED(hr)) {
-            Log("WASAPI capture unavailable: could not start capture.");
+            ReportFailure("IAudioClient::Start", hr, "could not start capture");
             cleanup();
             return;
         }
@@ -2774,6 +2875,8 @@ class WasapiMicCapture {
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> running_{false};
+    mutable std::mutex error_mutex_;
+    std::string last_failure_reason_;
     std::thread capture_thread_;
     ChunkCallback callback_;
     int sample_rate_hz_ = 16000;
@@ -2819,9 +2922,18 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
                 }
             });
             if (!started) {
-                Log("WASAPI microphone capture unavailable; speech turns disabled.");
+                const std::string reason = Trim(mic_capture_.last_failure_reason());
+                {
+                    std::lock_guard<std::mutex> lock(mic_reason_mutex_);
+                    mic_status_reason_ = reason.empty() ? "WASAPI capture unavailable" : reason;
+                }
+                Log("WASAPI microphone capture unavailable; speech turns disabled. reason=" + MicrophoneStatusHint());
                 return false;
             }
+        }
+        {
+            std::lock_guard<std::mutex> lock(mic_reason_mutex_);
+            mic_status_reason_.clear();
         }
 
         if (session_id_.empty()) {
@@ -2862,6 +2974,11 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
 
     bool vad_available() const {
         return vad_available_;
+    }
+
+    std::string MicrophoneStatusHint() const {
+        std::lock_guard<std::mutex> lock(mic_reason_mutex_);
+        return mic_status_reason_;
     }
 
     bool TryConsumeConsoleLine(const std::string& line, TranscriptEvent& out_event) override {
@@ -3031,6 +3148,8 @@ class SidecarSpeechInputAdapter final : public SpeechInputAdapter {
     bool pending_speech_start_event_ = false;
     bool speech_active_ = false;
     bool vad_available_ = true;
+    mutable std::mutex mic_reason_mutex_;
+    std::string mic_status_reason_;
     std::optional<std::chrono::steady_clock::time_point> last_speech_start_at_;
     WasapiMicCapture mic_capture_;
 };
@@ -3229,6 +3348,7 @@ class MainWindow : public QMainWindow {
         InitializeSidecarWithProgress();
         EnsurePlannerApiKeyAtStartup();
         camera_.Start(0);
+        StartInferenceWorker();
         RefreshStatusIndicators();
 
         poll_timer_.setInterval(120);
@@ -3237,15 +3357,202 @@ class MainWindow : public QMainWindow {
 
         startup_prompt_pending_ = true;
         AppendChat("system", "UI ready. Ask 'what next?' by voice or type below.");
+        AppendChat("system", "Gesture help: open hand=next, pinch=repeat, index=option A, two fingers=option B. Hold to confirm.");
     }
 
     ~MainWindow() override {
+        StopInferenceWorker();
         sidecar_manager_.Shutdown();
     }
 
     bool StartupFailed() const { return startup_failed_; }
 
    private:
+    struct InferenceTask {
+        uint64_t sequence = 0;
+        std::vector<uint8_t> frame_jpeg;
+        bool run_gesture = false;
+        bool run_vision = false;
+    };
+
+    struct InferenceResult {
+        uint64_t sequence = 0;
+        bool gesture_attempted = false;
+        bool gesture_ok = false;
+        Gesture gesture{"none", 0.0};
+        bool vision_attempted = false;
+        bool vision_ok = false;
+        std::vector<Detection> detections;
+    };
+
+    void StartInferenceWorker() {
+        stop_inference_worker_ = false;
+        inference_worker_thread_ = std::thread([this]() { InferenceWorkerLoop(); });
+    }
+
+    void StopInferenceWorker() {
+        {
+            std::lock_guard<std::mutex> lock(inference_worker_mutex_);
+            stop_inference_worker_ = true;
+        }
+        inference_worker_cv_.notify_all();
+        if (inference_worker_thread_.joinable()) {
+            inference_worker_thread_.join();
+        }
+    }
+
+    void InferenceWorkerLoop() {
+        while (true) {
+            InferenceTask task{};
+            {
+                std::unique_lock<std::mutex> lock(inference_worker_mutex_);
+                inference_worker_cv_.wait(lock, [this]() { return stop_inference_worker_ || inference_pending_.has_value(); });
+                if (stop_inference_worker_) {
+                    return;
+                }
+                task = *inference_pending_;
+                inference_pending_.reset();
+                inference_worker_busy_ = true;
+            }
+
+            InferenceResult result{};
+            result.sequence = task.sequence;
+            if (task.run_gesture) {
+                result.gesture_attempted = true;
+                result.gesture_ok = RequestGestureDetection(
+                    sidecar_host_,
+                    sidecar_port_,
+                    task.frame_jpeg,
+                    result.gesture,
+                    kInferenceGestureTimeoutMs);
+            }
+            if (task.run_vision) {
+                result.vision_attempted = true;
+                result.vision_ok = RequestVisionDetections(
+                    sidecar_host_,
+                    sidecar_port_,
+                    task.frame_jpeg,
+                    result.detections,
+                    kInferenceVisionTimeoutMs);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(inference_worker_mutex_);
+                latest_inference_result_ = result;
+                inference_result_ready_ = true;
+                inference_worker_busy_ = false;
+            }
+        }
+    }
+
+    bool IsSidecarTransportLive() const {
+        return sidecar_ok_ && latest_sidecar_health_.reachable && latest_sidecar_health_.alive;
+    }
+
+    void SubmitInferenceFrameIfDue(const std::chrono::steady_clock::time_point now) {
+        if (!IsSidecarTransportLive() || (!app_config_.gesture_enabled && !app_config_.vision_enabled)) {
+            return;
+        }
+
+        const auto gesture_it = latest_sidecar_health_.modalities.find("gesture");
+        const bool gesture_ready = gesture_it == latest_sidecar_health_.modalities.end() || gesture_it->second.status == "ready";
+        const auto vision_it = latest_sidecar_health_.modalities.find("vision");
+        const bool vision_ready = vision_it == latest_sidecar_health_.modalities.end() || vision_it->second.status == "ready";
+
+        const bool should_sample_gesture =
+            app_config_.gesture_enabled &&
+            gesture_ready &&
+            (!last_gesture_submit_at_.has_value() ||
+             now - *last_gesture_submit_at_ >= std::chrono::milliseconds(kGestureSampleIntervalMs));
+        const bool should_sample_vision =
+            app_config_.vision_enabled &&
+            vision_ready &&
+            (!last_vision_submit_at_.has_value() ||
+             now - *last_vision_submit_at_ >= std::chrono::milliseconds(kVisionSampleIntervalMs));
+        if (!should_sample_gesture && !should_sample_vision) {
+            return;
+        }
+
+        std::vector<uint8_t> latest_frame_jpeg;
+        if (!camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg)) {
+            if (should_sample_gesture) {
+                gesture_status_text_ = "camera-unavailable";
+                gesture_active_ = false;
+            }
+            return;
+        }
+
+        InferenceTask task{};
+        task.sequence = ++inference_sequence_counter_;
+        task.frame_jpeg = std::move(latest_frame_jpeg);
+        task.run_gesture = should_sample_gesture;
+        task.run_vision = should_sample_vision;
+
+        {
+            std::lock_guard<std::mutex> lock(inference_worker_mutex_);
+            if (inference_pending_.has_value()) {
+                ++dropped_inference_tasks_;
+            }
+            inference_pending_ = std::move(task);
+        }
+        inference_worker_cv_.notify_one();
+        if (should_sample_gesture) {
+            last_gesture_submit_at_ = now;
+        }
+        if (should_sample_vision) {
+            last_vision_submit_at_ = now;
+        }
+    }
+
+    void ConsumeLatestInferenceResult() {
+        std::optional<InferenceResult> maybe_result;
+        {
+            std::lock_guard<std::mutex> lock(inference_worker_mutex_);
+            if (!inference_result_ready_) {
+                return;
+            }
+            maybe_result = latest_inference_result_;
+            inference_result_ready_ = false;
+        }
+        if (!maybe_result.has_value()) {
+            return;
+        }
+        const InferenceResult& result = *maybe_result;
+        if (result.gesture_attempted) {
+            latest_detected_gesture_ = result.gesture;
+            if (!result.gesture_ok) {
+                gesture_status_text_ = "detect-timeout";
+                gesture_active_ = false;
+            } else {
+                gesture_active_ = result.gesture.label != "none" &&
+                                  result.gesture.confidence >= app_config_.gesture_confidence_threshold;
+                gesture_status_text_ =
+                    result.gesture.label + " " + std::to_string(static_cast<int>(result.gesture.confidence * 100.0)) + "%";
+                if (result.gesture.label != "none" &&
+                    (!IsSupportedGestureLabel(result.gesture.label) ||
+                     result.gesture.confidence < app_config_.gesture_confidence_threshold)) {
+                    RecordGestureFalsePositive(result.gesture.label, result.gesture.confidence, "below_threshold_or_unsupported");
+                }
+            }
+        }
+        if (result.vision_attempted && result.vision_ok) {
+            latest_turn_detections_ = result.detections;
+        }
+    }
+
+    void RecordGestureFalsePositive(const std::string& label, const double confidence, const std::string& reason) {
+        const std::string normalized_label = label.empty() ? "unknown" : label;
+        const int updated = ++gesture_false_positive_counters_[normalized_label];
+        if (updated == 1 || updated % 5 == 0) {
+            std::ostringstream oss;
+            oss << "gesture false-positive counter: label=" << normalized_label
+                << " count=" << updated
+                << " confidence=" << std::fixed << std::setprecision(2) << confidence
+                << " reason=" << reason;
+            Log(oss.str());
+        }
+    }
+
     void MaybePublishSidecarStartupError(const std::string& error_text) {
         const std::string trimmed = Trim(error_text);
         if (trimmed.empty()) {
@@ -3268,14 +3575,55 @@ class MainWindow : public QMainWindow {
         statusBar()->showMessage(QString::fromStdString(message), 6000);
     }
 
+    bool IsModalityRequired(const std::string& modality_name) const {
+        if (modality_name == "stt") {
+            return app_config_.speech_enabled;
+        }
+        if (modality_name == "vision") {
+            return app_config_.vision_enabled;
+        }
+        if (modality_name == "gesture") {
+            return app_config_.gesture_enabled;
+        }
+        return false;
+    }
+
+    std::string RequiredModalityFailure(const SidecarHealthStatus& health) const {
+        for (const std::string modality_name : {"stt", "vision", "gesture"}) {
+            if (!IsModalityRequired(modality_name)) {
+                continue;
+            }
+            const auto error_it = health.modality_errors.find(modality_name);
+            if (error_it != health.modality_errors.end() && !Trim(error_it->second).empty()) {
+                return modality_name + " failed: " + Trim(error_it->second);
+            }
+            const auto modality_it = health.modalities.find(modality_name);
+            if (modality_it != health.modalities.end() && modality_it->second.status == "failed") {
+                const std::string detail = Trim(modality_it->second.error);
+                if (!detail.empty()) {
+                    return modality_name + " failed: " + detail;
+                }
+                return modality_name + " failed";
+            }
+        }
+        return "";
+    }
+
     void UpdateSidecarHealthIssue(const SidecarHealthStatus& health) {
         latest_sidecar_health_ = health;
-        sidecar_health_ready_ = health.startup_ready;
+        sidecar_health_ready_ = health.ready_for_turns;
         if (!health.reachable || !health.alive) {
-            const std::string detail = !health.top_startup_error.empty() ? health.top_startup_error : "sidecar_unreachable";
-            MaybePublishSidecarStartupError(detail);
+            ++sidecar_transport_failure_streak_;
+            sidecar_health_ready_ = false;
+            sidecar_startup_error_ =
+                "sidecar unreachable (transport failures: " + std::to_string(sidecar_transport_failure_streak_) + ")";
+            const std::string chat_error =
+                sidecar_transport_failure_streak_ >= 3 ? "sidecar unreachable (transport instability)" : "sidecar unreachable";
+            MaybePublishSidecarStartupError(chat_error);
             return;
         }
+        sidecar_transport_failure_streak_ = 0;
+
         if (health.startup_ready) {
             sidecar_startup_error_.clear();
             if (app_config_.warmup_status != "completed") {
@@ -3283,8 +3631,19 @@ class MainWindow : public QMainWindow {
                 app_config_.warmup_message = "core models initialized";
                 SaveAppConfig(app_config_path_, app_config_);
             }
+        }
+
+        const std::string required_failure = RequiredModalityFailure(health);
+        if (!required_failure.empty()) {
+            MaybePublishSidecarStartupError(required_failure);
             return;
         }
+
+        if (health.ready_for_turns) {
+            sidecar_startup_error_.clear();
+            return;
+        }
+
         if (app_config_.warmup_status == "unknown") {
             app_config_.warmup_status = "downloading";
             app_config_.warmup_message = "models still downloading";
@@ -3321,15 +3680,6 @@ class MainWindow : public QMainWindow {
         if (changed) {
             sidecar_startup_error_ = progress_text;
             last_sidecar_startup_signature_ = signature_text;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (changed && (!last_reported_sidecar_error_at_.has_value() ||
-            now - *last_reported_sidecar_error_at_ >= std::chrono::seconds(30))) {
-            last_reported_sidecar_error_at_ = now;
-            const std::string message = "Sidecar online, " + progress_text;
-            AppendChat("system", message);
-            Log(message);
         }
     }
 
@@ -3733,6 +4083,18 @@ class MainWindow : public QMainWindow {
         runtime_settings_btn_ = new QPushButton("Runtime settings", this);
         right->addWidget(runtime_settings_btn_);
 
+        auto* gesture_help = new QLabel(
+            "Gesture help:\n"
+            "• Next: open hand, hold steady.\n"
+            "• Repeat: pinch thumb + index, hold.\n"
+            "• Option A: point with index finger.\n"
+            "• Option B: raise index + middle fingers.\n"
+            "Hold gesture until status reaches 100% to confirm.",
+            this);
+        gesture_help->setWordWrap(true);
+        gesture_help->setStyleSheet("QLabel { color: #9ad; font-size: 11px; }");
+        right->addWidget(gesture_help);
+
         dev_toggle_ = new QCheckBox("Developer debug", this);
         dev_toggle_->setChecked(debug_mode_enabled_);
         right->addWidget(dev_toggle_);
@@ -3795,6 +4157,8 @@ class MainWindow : public QMainWindow {
     void OnPollTick() {
         UpdateCameraPreview();
         const auto now = std::chrono::steady_clock::now();
+        SubmitInferenceFrameIfDue(now);
+        ConsumeLatestInferenceResult();
 
         if (startup_prompt_pending_) {
             startup_prompt_pending_ = false;
@@ -3859,41 +4223,19 @@ class MainWindow : public QMainWindow {
                 sidecar_status_->setText("sidecar: python runtime missing (see log)");
             }
         }
-        MaybeProcessGestureIntent();
+        MaybeProcessGestureIntent(now);
         RefreshStatusIndicators();
     }
 
-    void MaybeProcessGestureIntent() {
-        const auto now = std::chrono::steady_clock::now();
-        if (!sidecar_ok_ || !app_config_.gesture_enabled) {
+    void MaybeProcessGestureIntent(const std::chrono::steady_clock::time_point now) {
+        if (!IsSidecarTransportLive() || !app_config_.gesture_enabled) {
             gesture_status_text_ = "offline";
             return;
         }
-        if (last_gesture_sample_at_.has_value() &&
-            now - *last_gesture_sample_at_ < std::chrono::milliseconds(kGestureSampleIntervalMs)) {
-            return;
-        }
-        last_gesture_sample_at_ = now;
-
-        std::vector<uint8_t> latest_frame_jpeg;
-        if (!camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg)) {
-            gesture_status_text_ = "camera-unavailable";
-            gesture_active_ = false;
-            return;
-        }
-
-        Gesture detected_gesture{"none", 0.0};
-        if (!RequestGestureDetection(sidecar_host_, sidecar_port_, latest_frame_jpeg, detected_gesture)) {
-            gesture_status_text_ = "detect-error";
-            gesture_active_ = false;
-            return;
-        }
-        gesture_active_ = detected_gesture.label != "none" && detected_gesture.confidence >= kGestureMinConfidence;
-        gesture_status_text_ =
-            detected_gesture.label + " " + std::to_string(static_cast<int>(detected_gesture.confidence * 100.0)) + "%";
+        const Gesture detected_gesture = latest_detected_gesture_;
 
         if (!IsSupportedGestureLabel(detected_gesture.label) || detected_gesture.label == "none" ||
-            detected_gesture.confidence < kGestureMinConfidence) {
+            detected_gesture.confidence < app_config_.gesture_confidence_threshold) {
             dwell_label_.clear();
             dwell_started_at_.reset();
             return;
@@ -3904,8 +4246,17 @@ class MainWindow : public QMainWindow {
             dwell_started_at_ = now;
             return;
         }
-        if (!dwell_started_at_.has_value() ||
-            now - *dwell_started_at_ < std::chrono::milliseconds(kGestureDwellMs)) {
+        if (!dwell_started_at_.has_value()) {
+            return;
+        }
+        const auto dwell_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *dwell_started_at_).count();
+        const int dwell_required_ms = std::max(200, app_config_.gesture_dwell_ms);
+        const int hold_progress = static_cast<int>(std::clamp(
+            static_cast<double>(dwell_elapsed) / static_cast<double>(dwell_required_ms),
+            0.0,
+            1.0) * 100.0);
+        gesture_status_text_ = detected_gesture.label + " hold " + std::to_string(hold_progress) + "%";
+        if (dwell_elapsed < dwell_required_ms) {
             return;
         }
         if (now < gesture_cooldown_until_) {
@@ -3955,12 +4306,7 @@ class MainWindow : public QMainWindow {
 
     void ProcessTurn(const RuntimeIntent& intent) {
         const CameraSnapshot camera_snapshot = camera_.GetLatestSnapshot();
-        std::vector<Detection> turn_detections;
-        std::vector<uint8_t> latest_frame_jpeg;
-        const bool has_jpeg = sidecar_ok_ && app_config_.vision_enabled && camera_.TryEncodeLatestFrameJpeg(latest_frame_jpeg);
-        if (has_jpeg) {
-            RequestVisionDetections(sidecar_host_, sidecar_port_, latest_frame_jpeg, turn_detections);
-        }
+        const std::vector<Detection> turn_detections = latest_turn_detections_;
 
         std::string utterance = intent.utterance;
         Gesture turn_gesture = intent.gesture;
@@ -4040,6 +4386,7 @@ class MainWindow : public QMainWindow {
             last_speech_start_at_.has_value() &&
             now - *last_speech_start_at_ < std::chrono::milliseconds(kSpeechStartIndicatorHoldMs);
         std::string mic_label = "mic: ";
+        const std::string mic_hint = Trim(speech_input_.MicrophoneStatusHint());
         if (!sidecar_ok_) {
             mic_label += "offline";
         } else if (const auto it = latest_sidecar_health_.modalities.find("stt");
@@ -4056,6 +4403,9 @@ class MainWindow : public QMainWindow {
             }
         } else if (!app_config_.speech_enabled) {
             mic_label += "disabled";
+        } else if (!mic_hint.empty()) {
+            mic_label += "error";
+            mic_label += " (" + mic_hint + ")";
         } else if (!vad_available_) {
             mic_label += "listening (manual stop fallback)";
         } else if (speech_started_recently) {
@@ -4065,8 +4415,9 @@ class MainWindow : public QMainWindow {
         }
         mic_status_->setText(mic_label.c_str());
         tts_status_->setText(std::string("tts: ").append(tts_.IsSpeaking() ? "speaking" : "idle").c_str());
+        const bool transport_live = IsSidecarTransportLive();
         std::string gesture_label = "gesture: ";
-        if (!sidecar_ok_) {
+        if (!sidecar_ok_ || !transport_live) {
             gesture_label += "offline";
         } else if (!app_config_.gesture_enabled) {
             gesture_label += "disabled";
@@ -4089,7 +4440,7 @@ class MainWindow : public QMainWindow {
         }
         gesture_status_->setText(gesture_label.c_str());
         std::string planner_label = "planner: ";
-        if (!sidecar_ok_) {
+        if (!sidecar_ok_ || !transport_live) {
             planner_label += "offline fallback";
         } else if (planner_fallback_active_) {
             planner_label += "fallback active";
@@ -4102,17 +4453,24 @@ class MainWindow : public QMainWindow {
         }
         planner_status_->setText(planner_label.c_str());
         std::string sidecar_label = "sidecar: ";
-        if (!sidecar_ok_) {
+        if (!transport_live) {
+            sidecar_label += "offline";
+        } else if (!sidecar_ok_) {
             if (app_config_.warmup_status == "skipped" || app_config_.warmup_status == "failed" ||
                 app_config_.warmup_status == "downloading" || app_config_.warmup_status == "pending") {
                 sidecar_label += "models still downloading";
             } else {
                 sidecar_label += "offline";
             }
-        } else if (!sidecar_health_ready_) {
-            sidecar_label += "starting";
         } else {
-            sidecar_label += "healthy";
+            const std::string ready_mode = ToLower(Trim(latest_sidecar_health_.app_ready_mode));
+            if (ready_mode == "full" || sidecar_health_ready_) {
+                sidecar_label += "operational";
+            } else if (ready_mode == "degraded" || ready_mode == "core_only") {
+                sidecar_label += "operational (" + ready_mode + ")";
+            } else {
+                sidecar_label += "starting";
+            }
         }
         if (!sidecar_startup_error_.empty()) {
             sidecar_label += " - " + sidecar_startup_error_;
@@ -4158,11 +4516,15 @@ class MainWindow : public QMainWindow {
     bool vad_available_ = true;
     bool gesture_active_ = false;
     static constexpr int kGestureSampleIntervalMs = 220;
-    static constexpr int kGestureDwellMs = 420;
+    static constexpr int kVisionSampleIntervalMs = 320;
     static constexpr int kGestureCooldownMs = 1500;
-    static constexpr double kGestureMinConfidence = 0.65;
+    static constexpr int kInferenceGestureTimeoutMs = 420;
+    static constexpr int kInferenceVisionTimeoutMs = 520;
     std::string gesture_status_text_ = "idle";
-    std::optional<std::chrono::steady_clock::time_point> last_gesture_sample_at_;
+    std::optional<std::chrono::steady_clock::time_point> last_gesture_submit_at_;
+    std::optional<std::chrono::steady_clock::time_point> last_vision_submit_at_;
+    Gesture latest_detected_gesture_{"none", 0.0};
+    std::vector<Detection> latest_turn_detections_;
     std::optional<std::chrono::steady_clock::time_point> dwell_started_at_;
     std::chrono::steady_clock::time_point gesture_cooldown_until_ = std::chrono::steady_clock::time_point::min();
     std::string dwell_label_;
@@ -4174,6 +4536,18 @@ class MainWindow : public QMainWindow {
     SidecarHealthStatus latest_sidecar_health_{};
     std::string sidecar_startup_error_;
     std::string last_sidecar_startup_signature_;
+    int sidecar_transport_failure_streak_ = 0;
+    std::mutex inference_worker_mutex_;
+    std::condition_variable inference_worker_cv_;
+    std::thread inference_worker_thread_;
+    std::optional<InferenceTask> inference_pending_;
+    std::optional<InferenceResult> latest_inference_result_;
+    bool inference_result_ready_ = false;
+    bool inference_worker_busy_ = false;
+    bool stop_inference_worker_ = false;
+    uint64_t inference_sequence_counter_ = 0;
+    uint64_t dropped_inference_tasks_ = 0;
+    std::unordered_map<std::string, int> gesture_false_positive_counters_;
     std::optional<std::chrono::steady_clock::time_point> last_health_poll_at_;
     std::string last_startup_progress_message_;
     std::optional<std::chrono::steady_clock::time_point> last_startup_progress_at_;

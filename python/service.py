@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import base64
+import importlib.util
 import io
 import os
 import re
@@ -32,7 +33,6 @@ import numpy as np
 import cv2
 import mediapipe as mp
 from faster_whisper import WhisperModel
-from ultralytics import YOLO
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
@@ -500,6 +500,7 @@ class MediaPipeGestureAdapter:
     """Hand Landmarker + tiny fixed gesture vocabulary."""
 
     SUPPORTED_LABELS = {"next", "repeat", "option_a", "option_b", "none"}
+    ACTION_MIN_CONFIDENCE = {"next": 0.84, "repeat": 0.83, "option_a": 0.86, "option_b": 0.86}
 
     def __init__(self) -> None:
         self.model_path = CONFIG.gesture_model_path
@@ -517,9 +518,9 @@ class MediaPipeGestureAdapter:
             options = vision.HandLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=self._resolved_model_path),
                 num_hands=1,
-                min_hand_detection_confidence=0.4,
-                min_hand_presence_confidence=0.4,
-                min_tracking_confidence=0.4,
+                min_hand_detection_confidence=0.62,
+                min_hand_presence_confidence=0.62,
+                min_tracking_confidence=0.6,
             )
             self.landmarker = vision.HandLandmarker.create_from_options(options)
             logging.info("Gesture adapter ready with MediaPipe model: %s", self._resolved_model_path)
@@ -609,20 +610,39 @@ class MediaPipeGestureAdapter:
 
         label = "none"
         heuristic_confidence = 0.15
-        if extended_count >= 4:
+        if extended_count == 5 and pinch_ratio > 0.52:
             label = "next"
-            heuristic_confidence = 0.9
-        elif index_extended and middle_extended and not ring_extended and not pinky_extended:
+            heuristic_confidence = 0.92
+        elif (
+            index_extended
+            and middle_extended
+            and not ring_extended
+            and not pinky_extended
+            and not thumb_extended
+            and pinch_ratio > 0.45
+        ):
             label = "option_b"
-            heuristic_confidence = 0.82
-        elif index_extended and not middle_extended and not ring_extended and not pinky_extended:
+            heuristic_confidence = 0.86
+        elif (
+            index_extended
+            and not middle_extended
+            and not ring_extended
+            and not pinky_extended
+            and not thumb_extended
+            and pinch_ratio > 0.5
+        ):
             label = "option_a"
-            heuristic_confidence = 0.78
-        elif pinch_ratio < 0.35:
+            heuristic_confidence = 0.88
+        elif pinch_ratio < 0.28 and not middle_extended and not ring_extended and not pinky_extended:
             label = "repeat"
-            heuristic_confidence = 0.75
+            heuristic_confidence = 0.86
 
         confidence = max(0.0, min(1.0, (0.55 * detection_score) + (0.45 * heuristic_confidence)))
+        if label in self.ACTION_MIN_CONFIDENCE and (
+            detection_score < 0.72 or confidence < self.ACTION_MIN_CONFIDENCE[label]
+        ):
+            label = "none"
+            confidence = 0.0
         return {
             "label": label,
             "confidence": confidence,
@@ -678,21 +698,54 @@ class YoloVisionAdapter:
         self.model_name = CONFIG.vision_model
         self.confidence = CONFIG.vision_confidence
         self.vocabulary = list(FIXED_VOCABULARY)
-        self.model: YOLO | None = None
+        self.model: object | None = None
         self.failure_reason = ""
         self.cache_root = CONFIG.vision_cache_root
+        self.optional_unavailable = False
+
+    def _dependency_remediation(self) -> str:
+        return (
+            "install sidecar requirements during bootstrap "
+            "(python/bootstrap_sidecar_env.py with python/requirements.txt) "
+            "to include ultralytics and OpenAI CLIP"
+        )
+
+    def _missing_optional_dependency_reason(self) -> str:
+        if importlib.util.find_spec("ultralytics") is None:
+            return f"vision_optional_dependency_missing: ultralytics not installed; {self._dependency_remediation()}"
+        if "world" in self.model_name.lower() and importlib.util.find_spec("clip") is None:
+            return (
+                "vision_optional_dependency_missing: OpenAI CLIP package is missing for YOLO-World models; "
+                f"{self._dependency_remediation()}"
+            )
+        return ""
 
     def _init_model(self) -> None:
+        self.optional_unavailable = False
+        missing_dependency = self._missing_optional_dependency_reason()
+        if missing_dependency:
+            self.failure_reason = missing_dependency
+            self.model = None
+            self.optional_unavailable = True
+            logging.warning("Vision adapter optional dependency missing: %s", missing_dependency)
+            return
         try:
             os.environ["ULTRALYTICS_HOME"] = self.cache_root
+            os.environ.setdefault("YOLO_AUTOINSTALL", "False")
+            os.environ.setdefault("ULTRALYTICS_AUTOINSTALL", "False")
+            from ultralytics import YOLO  # imported lazily to keep failure reason actionable
+
             self.model = YOLO(self.model_name)
             if "world" in self.model_name.lower():
                 self.model.set_classes(self.vocabulary)
             logging.info("Vision adapter ready: model=%s vocabulary=%s", self.model_name, ",".join(self.vocabulary))
         except Exception as exc:  # noqa: BLE001
-            self.failure_reason = "vision_model_init_failed"
+            self.failure_reason = (
+                "vision_model_init_failed: "
+                f"{exc}. Disable runtime autoinstall and preinstall deps via bootstrap/requirements."
+            )
             self.model = None
-            logging.warning("Vision adapter disabled: %s", exc)
+            logging.warning("Vision adapter disabled: %s", self.failure_reason)
 
     @staticmethod
     def _decode_image(payload: dict) -> np.ndarray:
@@ -841,6 +894,17 @@ class StartupReadinessManager:
         try:
             VISION_ADAPTER._init_model()
             if VISION_ADAPTER.model is None:
+                if VISION_ADAPTER.optional_unavailable:
+                    self.required_modalities.discard("vision")
+                    self._set_modality(
+                        "vision",
+                        status="disabled",
+                        progress=1.0,
+                        message="optional dependency unavailable",
+                        error="",
+                    )
+                    logging.warning("Vision optional dependency unavailable; sidecar remains usable.")
+                    return
                 raise RuntimeError(VISION_ADAPTER.failure_reason or "vision_unavailable")
             self._set_modality("vision", status="ready", progress=1.0, message="ready", error="")
         except Exception as exc:  # noqa: BLE001
@@ -1159,6 +1223,17 @@ class LlmPlannerAdapter:
             {"role": "user", "content": json.dumps(user_payload, separators=(",", ":"))},
         ]
 
+    @staticmethod
+    def _normalize_planner_contract_payload(payload: dict) -> dict:
+        planner_contract = payload.get("planner_contract")
+        if isinstance(planner_contract, dict):
+            logging.info("planner llm contract parse: wrapped planner_contract payload")
+            return _coerce_planner_response(planner_contract)
+        if "planner_contract" in payload:
+            logging.warning("planner llm contract parse: malformed planner_contract wrapper; using root fallback")
+        logging.info("planner llm contract parse: root payload")
+        return _coerce_planner_response(payload)
+
     def _invoke_openai_compatible(self, messages: list[dict]) -> dict:
         if not self.api_key:
             raise RuntimeError("llm_api_key_missing")
@@ -1212,11 +1287,39 @@ class LlmPlannerAdapter:
         )
         messages = self._build_messages(turn_context)
         if self.provider == "openai_compatible":
-            return _coerce_planner_response(self._invoke_openai_compatible(messages))
+            raw_response = self._invoke_openai_compatible(messages)
+            return self._normalize_planner_contract_payload(raw_response)
         raise RuntimeError(f"unsupported_llm_provider:{self.provider}")
 
 
+def _validate_planner_response_normalization() -> None:
+    root_payload = {
+        "assistant_text": "Root shape response.",
+        "speak": True,
+        "interruptible": True,
+        "advance_step": False,
+        "new_branch_id": None,
+        "ui_overlays": [],
+    }
+    wrapped_payload = {
+        "planner_contract": {
+            "assistant_text": "Wrapped shape response.",
+            "speak": False,
+            "interruptible": False,
+            "advance_step": True,
+            "new_branch_id": "pot",
+            "ui_overlays": [{"type": "highlight_label", "target": "pot"}],
+        }
+    }
+    normalized_root = LlmPlannerAdapter._normalize_planner_contract_payload(root_payload)
+    normalized_wrapped = LlmPlannerAdapter._normalize_planner_contract_payload(wrapped_payload)
+    assert normalized_root["assistant_text"] == "Root shape response."
+    assert normalized_wrapped["assistant_text"] == "Wrapped shape response."
+    assert normalized_wrapped["new_branch_id"] == "pot"
+
+
 PLANNER_ADAPTER = LlmPlannerAdapter()
+_validate_planner_response_normalization()
 PLANNER_RUNTIME_STATUS = {
     "fallback_active": False,
     "last_error": "",
@@ -1371,14 +1474,36 @@ def _planner_with_fallback(turn_context: dict) -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     _health_log_counter = 0
+    _DISCONNECT_WINERRORS = {10053, 10054}
+    _DISCONNECT_ERRNOS = {32, 104}
+
+    class ClientDisconnected(Exception):
+        """Request ended because client disconnected before response write completed."""
+
+    @classmethod
+    def _is_disconnect_error(cls, exc: BaseException) -> bool:
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return True
+        if isinstance(exc, OSError):
+            if getattr(exc, "winerror", None) in cls._DISCONNECT_WINERRORS:
+                return True
+            if getattr(exc, "errno", None) in cls._DISCONNECT_ERRNOS:
+                return True
+        return False
 
     def _write_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:  # noqa: BLE001
+            if self._is_disconnect_error(exc):
+                logging.debug("client disconnected during response write: path=%s status=%d", self.path, status)
+                raise Handler.ClientDisconnected() from exc
+            raise
 
     def log_message(self, fmt: str, *args) -> None:
         rendered = fmt % args
@@ -1406,6 +1531,12 @@ class Handler(BaseHTTPRequestHandler):
         return str(modality_info.get("status", "")).strip().lower() == "ready"
 
     def do_GET(self) -> None:
+        try:
+            self._do_GET_impl()
+        except Handler.ClientDisconnected:
+            return
+
+    def _do_GET_impl(self) -> None:
         if self.path == "/health":
             Handler._health_log_counter += 1
             if Handler._health_log_counter % 30 == 1:
@@ -1465,6 +1596,12 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(404, {"error": "not_found", "path": self.path})
 
     def do_POST(self) -> None:
+        try:
+            self._do_POST_impl()
+        except Handler.ClientDisconnected:
+            return
+
+    def _do_POST_impl(self) -> None:
         logging.info("request POST %s", self.path)
         content_length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
@@ -1561,9 +1698,14 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._write_json(400, {"error": str(exc)})
             return
+        except Handler.ClientDisconnected:
+            return
         except Exception as exc:  # noqa: BLE001
             logging.exception("sidecar endpoint failure: %s", exc)
-            self._write_json(500, {"error": "sidecar_failure", "detail": str(exc)})
+            try:
+                self._write_json(500, {"error": "sidecar_failure", "detail": str(exc)})
+            except Handler.ClientDisconnected:
+                return
             return
 
         self._write_json(404, {"error": "not_found", "path": self.path})

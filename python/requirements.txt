@@ -3,6 +3,8 @@ numpy>=1.24
 mediapipe>=0.10.14
 opencv-python-headless>=4.10.0.84
 ultralytics>=8.3.0
+# YOLO-World models (for example yolov8s-worldv2.pt) require the OpenAI CLIP package variant.
+git+https://github.com/openai/CLIP.git
 # Optional: only required when MIMOCA_VISION_MODEL points to a local ONNX model path.
 # Keep within the 1.x line for compatibility while avoiding older vulnerable/incompatible builds.
 onnxruntime>=1.19.2,<2
