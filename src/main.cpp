@@ -63,6 +63,7 @@
 #include <sphelper.h>
 #else
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -1402,49 +1403,62 @@ bool SendHttpRequest(const std::string& host,
     }
 #endif
 
-    int socket_fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
-    if (socket_fd < 0) {
-        Log("Failed to create socket.");
+    auto close_socket = [](int fd) {
 #ifdef _WIN32
-        WSACleanup();
+        closesocket(fd);
+#else
+        close(fd);
 #endif
-        return false;
-    }
-
-    if (timeout_ms > 0) {
+    };
+    auto apply_timeouts = [timeout_ms](int fd) {
+        if (timeout_ms <= 0) {
+            return;
+        }
 #ifdef _WIN32
         const DWORD timeout_dw = static_cast<DWORD>(timeout_ms);
-        setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_dw), sizeof(timeout_dw));
-        setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_dw), sizeof(timeout_dw));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_dw), sizeof(timeout_dw));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_dw), sizeof(timeout_dw));
 #else
         const timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
-    }
+    };
 
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(static_cast<uint16_t>(port));
-
-    if (::inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
-        Log("Invalid host address: " + host);
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* resolved = nullptr;
+    const std::string port_text = std::to_string(port);
+    if (::getaddrinfo(host.c_str(), port_text.c_str(), &hints, &resolved) != 0 || resolved == nullptr) {
+        Log("Could not resolve Python sidecar host: " + host);
 #ifdef _WIN32
-        closesocket(socket_fd);
         WSACleanup();
-#else
-        close(socket_fd);
 #endif
         return false;
     }
 
-    if (::connect(socket_fd, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+    int socket_fd = -1;
+    bool connected = false;
+    for (addrinfo* node = resolved; node != nullptr; node = node->ai_next) {
+        const int candidate_fd = static_cast<int>(::socket(node->ai_family, node->ai_socktype, node->ai_protocol));
+        if (candidate_fd < 0) {
+            continue;
+        }
+        apply_timeouts(candidate_fd);
+        if (::connect(candidate_fd, node->ai_addr, static_cast<int>(node->ai_addrlen)) == 0) {
+            socket_fd = candidate_fd;
+            connected = true;
+            break;
+        }
+        close_socket(candidate_fd);
+    }
+    ::freeaddrinfo(resolved);
+
+    if (!connected || socket_fd < 0) {
         Log("Could not connect to Python sidecar at http://" + host + ":" + std::to_string(port));
 #ifdef _WIN32
-        closesocket(socket_fd);
         WSACleanup();
-#else
-        close(socket_fd);
 #endif
         return false;
     }
@@ -1456,11 +1470,9 @@ bool SendHttpRequest(const std::string& host,
 #endif
     if (sent <= 0) {
         Log("Failed to send request to Python sidecar.");
+        close_socket(socket_fd);
 #ifdef _WIN32
-        closesocket(socket_fd);
         WSACleanup();
-#else
-        close(socket_fd);
 #endif
         return false;
     }
@@ -1479,11 +1491,9 @@ bool SendHttpRequest(const std::string& host,
         response_out.append(buffer, static_cast<size_t>(bytes_read));
     }
 
+    close_socket(socket_fd);
 #ifdef _WIN32
-    closesocket(socket_fd);
     WSACleanup();
-#else
-    close(socket_fd);
 #endif
 
     return !response_out.empty();
@@ -4443,7 +4453,9 @@ class MainWindow : public QMainWindow {
         }
         planner_status_->setText(planner_label.c_str());
         std::string sidecar_label = "sidecar: ";
-        if (!sidecar_ok_ || !transport_live) {
+        if (!transport_live) {
+            sidecar_label += "offline";
+        } else if (!sidecar_ok_) {
             if (app_config_.warmup_status == "skipped" || app_config_.warmup_status == "failed" ||
                 app_config_.warmup_status == "downloading" || app_config_.warmup_status == "pending") {
                 sidecar_label += "models still downloading";
