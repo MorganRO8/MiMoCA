@@ -244,6 +244,10 @@ struct AppConfig {
     std::string stt_model = "distil-large-v3";
     std::string vision_model = "yolov8s-worldv2.pt";
     std::string gesture_model_path = "python/models/hand_landmarker.task";
+    std::string cache_root;
+    std::string stt_cache_root;
+    std::string vision_cache_root;
+    std::string gesture_cache_root;
     bool debug_overlay_enabled = false;
 };
 
@@ -836,6 +840,13 @@ bool ParseInt(const std::string& text, int& out_value) {
     return true;
 }
 
+std::string CachePathOrDefault(const std::string& root, const std::string& leaf) {
+    if (root.empty()) {
+        return "";
+    }
+    return (std::filesystem::path(root) / std::filesystem::path(leaf)).string();
+}
+
 AppConfig LoadAppConfig(const std::string& path) {
     AppConfig config{};
     const std::string json = ReadFileText(path);
@@ -895,6 +906,14 @@ AppConfig LoadAppConfig(const std::string& path) {
     if (!gesture_model_path.empty()) {
         config.gesture_model_path = gesture_model_path;
     }
+    const std::string cache_json = ExtractJsonFieldObject(json, "cache");
+    config.cache_root = Trim(ExtractJsonFieldString(cache_json, "model_cache_root"));
+    if (config.cache_root.empty()) {
+        config.cache_root = Trim(ExtractJsonFieldString(cache_json, "cache_root"));
+    }
+    config.stt_cache_root = Trim(ExtractJsonFieldString(cache_json, "stt_cache_root"));
+    config.vision_cache_root = Trim(ExtractJsonFieldString(cache_json, "vision_cache_root"));
+    config.gesture_cache_root = Trim(ExtractJsonFieldString(cache_json, "gesture_cache_root"));
 
     const std::string debug_json = ExtractJsonFieldObject(json, "debug");
     config.debug_overlay_enabled = ExtractJsonFieldBool(debug_json, "overlay_enabled", false);
@@ -931,6 +950,12 @@ bool SaveAppConfig(const std::string& path, const AppConfig& config) {
     output << "    \"vision_model\": \"" << EscapeJson(config.vision_model) << "\",\n";
     output << "    \"gesture_model_path\": \"" << EscapeJson(config.gesture_model_path) << "\"\n";
     output << "  },\n";
+    output << "  \"cache\": {\n";
+    output << "    \"model_cache_root\": \"" << EscapeJson(config.cache_root) << "\",\n";
+    output << "    \"stt_cache_root\": \"" << EscapeJson(config.stt_cache_root) << "\",\n";
+    output << "    \"vision_cache_root\": \"" << EscapeJson(config.vision_cache_root) << "\",\n";
+    output << "    \"gesture_cache_root\": \"" << EscapeJson(config.gesture_cache_root) << "\"\n";
+    output << "  },\n";
     output << "  \"debug\": {\n";
     output << "    \"overlay_enabled\": " << BoolJson(config.debug_overlay_enabled) << "\n";
     output << "  }\n";
@@ -965,6 +990,22 @@ void ApplyEnvOverrides(AppConfig& config) {
     if (!gesture_model.empty()) {
         config.gesture_model_path = gesture_model;
     }
+    const std::string cache_root = Trim(EnvOrDefault("MIMOCA_MODEL_CACHE_ROOT", ""));
+    if (!cache_root.empty()) {
+        config.cache_root = cache_root;
+    }
+    const std::string stt_cache_root = Trim(EnvOrDefault("MIMOCA_STT_CACHE_ROOT", ""));
+    if (!stt_cache_root.empty()) {
+        config.stt_cache_root = stt_cache_root;
+    }
+    const std::string vision_cache_root = Trim(EnvOrDefault("MIMOCA_VISION_CACHE_ROOT", ""));
+    if (!vision_cache_root.empty()) {
+        config.vision_cache_root = vision_cache_root;
+    }
+    const std::string gesture_cache_root = Trim(EnvOrDefault("MIMOCA_GESTURE_CACHE_ROOT", ""));
+    if (!gesture_cache_root.empty()) {
+        config.gesture_cache_root = gesture_cache_root;
+    }
     const std::string debug_env = ToLower(Trim(EnvOrDefault("MIMOCA_DEBUG", "")));
     if (!debug_env.empty()) {
         config.debug_overlay_enabled = debug_env == "1" || debug_env == "true" || debug_env == "on";
@@ -988,6 +1029,10 @@ void LogEffectiveConfig(const AppConfig& config) {
         << " model_paths[stt=" << config.stt_model
         << ",vision=" << config.vision_model
         << ",gesture=" << config.gesture_model_path << "]"
+        << " cache[model=" << config.cache_root
+        << ",stt=" << config.stt_cache_root
+        << ",vision=" << config.vision_cache_root
+        << ",gesture=" << config.gesture_cache_root << "]"
         << " secrets[planner_api_key=redacted_secure_store]";
     Log(oss.str());
 }
@@ -3133,6 +3178,27 @@ class MainWindow : public QMainWindow {
         SetEnvVar("MIMOCA_LLM_PROVIDER", app_config_.planner_provider);
         SetEnvVar("MIMOCA_LLM_BASE_URL", app_config_.llm_base_url);
         SetEnvVar("MIMOCA_LLM_MODEL", app_config_.llm_model);
+        if (!app_config_.cache_root.empty()) {
+            SetEnvVar("MIMOCA_MODEL_CACHE_ROOT", app_config_.cache_root);
+        }
+        const std::string stt_cache = !app_config_.stt_cache_root.empty()
+                                          ? app_config_.stt_cache_root
+                                          : CachePathOrDefault(app_config_.cache_root, "stt");
+        const std::string vision_cache = !app_config_.vision_cache_root.empty()
+                                             ? app_config_.vision_cache_root
+                                             : CachePathOrDefault(app_config_.cache_root, "vision");
+        const std::string gesture_cache = !app_config_.gesture_cache_root.empty()
+                                              ? app_config_.gesture_cache_root
+                                              : CachePathOrDefault(app_config_.cache_root, "gesture");
+        if (!stt_cache.empty()) {
+            SetEnvVar("MIMOCA_STT_CACHE_ROOT", stt_cache);
+        }
+        if (!vision_cache.empty()) {
+            SetEnvVar("MIMOCA_VISION_CACHE_ROOT", vision_cache);
+        }
+        if (!gesture_cache.empty()) {
+            SetEnvVar("MIMOCA_GESTURE_CACHE_ROOT", gesture_cache);
+        }
 
         PythonSidecarManager::StartOptions options;
         options.host = sidecar_host_;
