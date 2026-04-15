@@ -3268,14 +3268,55 @@ class MainWindow : public QMainWindow {
         statusBar()->showMessage(QString::fromStdString(message), 6000);
     }
 
+    bool IsModalityRequired(const std::string& modality_name) const {
+        if (modality_name == "stt") {
+            return app_config_.speech_enabled;
+        }
+        if (modality_name == "vision") {
+            return app_config_.vision_enabled;
+        }
+        if (modality_name == "gesture") {
+            return app_config_.gesture_enabled;
+        }
+        return false;
+    }
+
+    std::string RequiredModalityFailure(const SidecarHealthStatus& health) const {
+        for (const std::string modality_name : {"stt", "vision", "gesture"}) {
+            if (!IsModalityRequired(modality_name)) {
+                continue;
+            }
+            const auto error_it = health.modality_errors.find(modality_name);
+            if (error_it != health.modality_errors.end() && !Trim(error_it->second).empty()) {
+                return modality_name + " failed: " + Trim(error_it->second);
+            }
+            const auto modality_it = health.modalities.find(modality_name);
+            if (modality_it != health.modalities.end() && modality_it->second.status == "failed") {
+                const std::string detail = Trim(modality_it->second.error);
+                if (!detail.empty()) {
+                    return modality_name + " failed: " + detail;
+                }
+                return modality_name + " failed";
+            }
+        }
+        return "";
+    }
+
     void UpdateSidecarHealthIssue(const SidecarHealthStatus& health) {
         latest_sidecar_health_ = health;
-        sidecar_health_ready_ = health.startup_ready;
+        sidecar_health_ready_ = health.ready_for_turns;
         if (!health.reachable || !health.alive) {
-            const std::string detail = !health.top_startup_error.empty() ? health.top_startup_error : "sidecar_unreachable";
-            MaybePublishSidecarStartupError(detail);
+            ++sidecar_transport_failure_streak_;
+            std::ostringstream detail;
+            detail << "sidecar unreachable";
+            if (sidecar_transport_failure_streak_ >= 3) {
+                detail << " (transport failures: " << sidecar_transport_failure_streak_ << ")";
+            }
+            MaybePublishSidecarStartupError(detail.str());
             return;
         }
+        sidecar_transport_failure_streak_ = 0;
+
         if (health.startup_ready) {
             sidecar_startup_error_.clear();
             if (app_config_.warmup_status != "completed") {
@@ -3283,8 +3324,19 @@ class MainWindow : public QMainWindow {
                 app_config_.warmup_message = "core models initialized";
                 SaveAppConfig(app_config_path_, app_config_);
             }
+        }
+
+        if (health.ready_for_turns) {
+            sidecar_startup_error_.clear();
             return;
         }
+
+        const std::string required_failure = RequiredModalityFailure(health);
+        if (!required_failure.empty()) {
+            MaybePublishSidecarStartupError(required_failure);
+            return;
+        }
+
         if (app_config_.warmup_status == "unknown") {
             app_config_.warmup_status = "downloading";
             app_config_.warmup_message = "models still downloading";
@@ -3321,15 +3373,6 @@ class MainWindow : public QMainWindow {
         if (changed) {
             sidecar_startup_error_ = progress_text;
             last_sidecar_startup_signature_ = signature_text;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (changed && (!last_reported_sidecar_error_at_.has_value() ||
-            now - *last_reported_sidecar_error_at_ >= std::chrono::seconds(30))) {
-            last_reported_sidecar_error_at_ = now;
-            const std::string message = "Sidecar online, " + progress_text;
-            AppendChat("system", message);
-            Log(message);
         }
     }
 
@@ -4109,10 +4152,15 @@ class MainWindow : public QMainWindow {
             } else {
                 sidecar_label += "offline";
             }
-        } else if (!sidecar_health_ready_) {
-            sidecar_label += "starting";
         } else {
-            sidecar_label += "healthy";
+            const std::string ready_mode = ToLower(Trim(latest_sidecar_health_.app_ready_mode));
+            if (ready_mode == "full" || sidecar_health_ready_) {
+                sidecar_label += "operational";
+            } else if (ready_mode == "degraded" || ready_mode == "core_only") {
+                sidecar_label += "operational (" + ready_mode + ")";
+            } else {
+                sidecar_label += "starting";
+            }
         }
         if (!sidecar_startup_error_.empty()) {
             sidecar_label += " - " + sidecar_startup_error_;
@@ -4174,6 +4222,7 @@ class MainWindow : public QMainWindow {
     SidecarHealthStatus latest_sidecar_health_{};
     std::string sidecar_startup_error_;
     std::string last_sidecar_startup_signature_;
+    int sidecar_transport_failure_streak_ = 0;
     std::optional<std::chrono::steady_clock::time_point> last_health_poll_at_;
     std::string last_startup_progress_message_;
     std::optional<std::chrono::steady_clock::time_point> last_startup_progress_at_;
