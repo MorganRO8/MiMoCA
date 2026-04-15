@@ -755,11 +755,25 @@ class StartupReadinessManager:
             self.updated_at = datetime.now(timezone.utc).isoformat()
 
     def _run(self) -> None:
-        os.makedirs(CONFIG.cache_root, exist_ok=True)
-        self._initialize_stt()
-        self._initialize_vision()
-        self._initialize_gesture()
-        self._finalize_state()
+        try:
+            os.makedirs(CONFIG.cache_root, exist_ok=True)
+            self._initialize_stt()
+            self._initialize_vision()
+            self._initialize_gesture()
+            self._finalize_state()
+        except Exception as exc:  # noqa: BLE001
+            root_error = f"startup initialization crashed: {type(exc).__name__}: {exc}"
+            logging.exception("startup readiness manager crashed")
+            with self._lock:
+                self.state = "failed"
+                self.message = root_error
+                for modality in self.modalities.values():
+                    if modality.status != "ready":
+                        modality.status = "failed"
+                        modality.progress = 1.0
+                        modality.message = "failed due to startup crash"
+                        modality.error = root_error
+                self.updated_at = datetime.now(timezone.utc).isoformat()
 
     def _initialize_stt(self) -> None:
         self._set_modality("stt", status="downloading", progress=0.05, message="initializing")
@@ -849,6 +863,28 @@ class StartupReadinessManager:
 
 
 STARTUP_MANAGER = StartupReadinessManager()
+
+
+def _startup_summary(readiness: dict) -> str:
+    state = str(readiness.get("state", "downloading"))
+    message = str(readiness.get("message", "")).strip()
+    modality_errors = []
+    for name, info in readiness.get("modalities", {}).items():
+        error_text = str(info.get("error", "")).strip()
+        if error_text:
+            modality_errors.append(f"{name}: {error_text}")
+    if modality_errors:
+        return f"{message or state}; modality_errors={'; '.join(modality_errors)}"
+    return message or state
+
+
+def _modality_errors(readiness: dict) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for name, info in readiness.get("modalities", {}).items():
+        error_text = str(info.get("error", "")).strip()
+        if error_text:
+            result[name] = error_text
+    return result
 
 
 def _constrain_assistant_text(text: str) -> str:
@@ -1266,15 +1302,18 @@ class Handler(BaseHTTPRequestHandler):
             ready_for_app = startup_state in {"ready", "degraded"}
             status_code = 200 if ready_for_app else 503
             planner_runtime = _planner_runtime_snapshot()
+            startup_summary = _startup_summary(readiness)
+            modality_errors = _modality_errors(readiness)
             self._write_json(
                 status_code,
                 {
-                    "status": "ok" if ready_for_app else "initializing",
+                    "status": "ok" if ready_for_app else ("failed" if startup_state == "failed" else "initializing"),
                     "service": "mimoca-python-sidecar",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "startup": readiness,
                     "startup_ready": ready_for_app,
-                    "startup_summary": readiness.get("message", ""),
+                    "startup_summary": startup_summary,
+                    "modality_errors": modality_errors,
                     "stt_model": SPEECH_ADAPTER.model_name,
                     "stt_device": SPEECH_ADAPTER.device,
                     "stt_compute_type": SPEECH_ADAPTER.compute_type,
