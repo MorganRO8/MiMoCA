@@ -3274,6 +3274,8 @@ class MainWindow : public QMainWindow {
             progress << " (" << health.startup_state << ")";
         }
         progress << " " << std::fixed << std::setprecision(0) << std::clamp(health.progress, 0.0, 1.0) * 100.0 << "%";
+        std::ostringstream signature;
+        signature << health.startup_state << ":" << static_cast<int>(std::clamp(health.progress, 0.0, 1.0) * 100.0);
         for (const std::string modality_name : {"stt", "vision", "gesture"}) {
             const auto it = health.modalities.find(modality_name);
             if (it == health.modalities.end()) {
@@ -3286,15 +3288,23 @@ class MainWindow : public QMainWindow {
             } else {
                 progress << "unknown";
             }
-            progress << " " << std::fixed << std::setprecision(0) << std::clamp(modality.progress, 0.0, 1.0) * 100.0 << "%";
+            const int modality_percent = static_cast<int>(std::clamp(modality.progress, 0.0, 1.0) * 100.0);
+            progress << " " << std::fixed << std::setprecision(0) << modality_percent << "%";
+            signature << "|" << modality_name << ":" << modality.status << ":" << modality_percent;
         }
-        sidecar_startup_error_ = progress.str();
+        const std::string progress_text = progress.str();
+        const std::string signature_text = signature.str();
+        const bool changed = signature_text != last_sidecar_startup_signature_;
+        if (changed) {
+            sidecar_startup_error_ = progress_text;
+            last_sidecar_startup_signature_ = signature_text;
+        }
 
         const auto now = std::chrono::steady_clock::now();
-        if (!last_reported_sidecar_error_at_.has_value() ||
+        if (changed && (!last_reported_sidecar_error_at_.has_value() ||
             now - *last_reported_sidecar_error_at_ >= std::chrono::seconds(30)) {
             last_reported_sidecar_error_at_ = now;
-            const std::string message = "Sidecar online, " + sidecar_startup_error_;
+            const std::string message = "Sidecar online, " + progress_text;
             AppendChat("system", message);
             Log(message);
         }
@@ -3350,6 +3360,15 @@ class MainWindow : public QMainWindow {
         options.startup_retry_delay_ms = EnvIntOrDefault("MIMOCA_SIDECAR_HEALTH_RETRY_MS", 250);
 
         const auto progress = [this](const std::string& message) {
+            const auto now = std::chrono::steady_clock::now();
+            const bool duplicate = message == last_startup_progress_message_ &&
+                                   last_startup_progress_at_.has_value() &&
+                                   now - *last_startup_progress_at_ < std::chrono::seconds(2);
+            if (duplicate) {
+                return;
+            }
+            last_startup_progress_message_ = message;
+            last_startup_progress_at_ = now;
             statusBar()->showMessage(QString::fromStdString(message));
             sidecar_status_->setText(("sidecar: " + message).c_str());
             QApplication::processEvents();
@@ -3752,6 +3771,7 @@ class MainWindow : public QMainWindow {
 
     void OnPollTick() {
         UpdateCameraPreview();
+        const auto now = std::chrono::steady_clock::now();
 
         if (startup_prompt_pending_) {
             startup_prompt_pending_ = false;
@@ -3781,34 +3801,40 @@ class MainWindow : public QMainWindow {
         }
         mic_active_ = speech_input_.speech_active();
         vad_available_ = speech_input_.vad_available();
-        const bool sidecar_previously_ok = sidecar_ok_;
-        sidecar_ok_ = sidecar_manager_.PollAndRestartIfNeeded([this](const std::string& message) {
-            statusBar()->showMessage(QString::fromStdString(message), 3000);
-            Log(message);
-        });
-        if (sidecar_ok_ && !sidecar_previously_ok) {
-            speech_input_.OnSidecarRestarted();
-            if (app_config_.speech_enabled) {
-                speech_input_.StartConversation();
+        const int health_poll_interval_ms = sidecar_health_ready_ ? 600 : 1500;
+        const bool should_poll_health = !last_health_poll_at_.has_value() ||
+                                        now - *last_health_poll_at_ >= std::chrono::milliseconds(health_poll_interval_ms);
+        if (should_poll_health) {
+            last_health_poll_at_ = now;
+            const bool sidecar_previously_ok = sidecar_ok_;
+            sidecar_ok_ = sidecar_manager_.PollAndRestartIfNeeded([this](const std::string& message) {
+                statusBar()->showMessage(QString::fromStdString(message), 3000);
+                Log(message);
+            });
+            if (sidecar_ok_ && !sidecar_previously_ok) {
+                speech_input_.OnSidecarRestarted();
+                if (app_config_.speech_enabled) {
+                    speech_input_.StartConversation();
+                }
             }
-        }
-        if (sidecar_ok_) {
-            const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
-            UpdateSidecarHealthIssue(health);
-            planner_mode_ = health.planner_mode;
-            planner_llm_configured_ = health.planner_llm_configured;
-            planner_fallback_active_ = health.planner_fallback_active;
-        } else {
-            sidecar_health_ready_ = false;
-            const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
-            if (health.reachable) {
+            if (sidecar_ok_) {
+                const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
                 UpdateSidecarHealthIssue(health);
+                planner_mode_ = health.planner_mode;
+                planner_llm_configured_ = health.planner_llm_configured;
+                planner_fallback_active_ = health.planner_fallback_active;
+            } else {
+                sidecar_health_ready_ = false;
+                const SidecarHealthStatus health = QueryPythonHealth(sidecar_host_, sidecar_port_);
+                if (health.reachable) {
+                    UpdateSidecarHealthIssue(health);
+                }
+                planner_fallback_active_ = true;
             }
-            planner_fallback_active_ = true;
-        }
-        if (!sidecar_ok_ && sidecar_manager_.runtime_missing()) {
-            MaybePublishSidecarStartupError("python runtime missing (see log)");
-            sidecar_status_->setText("sidecar: python runtime missing (see log)");
+            if (!sidecar_ok_ && sidecar_manager_.runtime_missing()) {
+                MaybePublishSidecarStartupError("python runtime missing (see log)");
+                sidecar_status_->setText("sidecar: python runtime missing (see log)");
+            }
         }
         MaybeProcessGestureIntent();
         RefreshStatusIndicators();
@@ -4119,6 +4145,10 @@ class MainWindow : public QMainWindow {
     bool sidecar_health_ready_ = false;
     SidecarHealthStatus latest_sidecar_health_{};
     std::string sidecar_startup_error_;
+    std::string last_sidecar_startup_signature_;
+    std::optional<std::chrono::steady_clock::time_point> last_health_poll_at_;
+    std::string last_startup_progress_message_;
+    std::optional<std::chrono::steady_clock::time_point> last_startup_progress_at_;
     std::string last_reported_sidecar_error_;
     std::optional<std::chrono::steady_clock::time_point> last_reported_sidecar_error_at_;
 

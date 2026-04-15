@@ -1351,6 +1351,8 @@ def _planner_with_fallback(turn_context: dict) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
+    _health_log_counter = 0
+
     def _write_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -1360,7 +1362,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args) -> None:
-        logging.info("%s - %s", self.address_string(), fmt % args)
+        rendered = fmt % args
+        if "GET /health " in rendered:
+            logging.debug("%s - %s", self.address_string(), rendered)
+            return
+        logging.info("%s - %s", self.address_string(), rendered)
 
     def _modality_not_ready_payload(self, modality_name: str) -> dict:
         readiness = STARTUP_MANAGER.snapshot()
@@ -1381,7 +1387,14 @@ class Handler(BaseHTTPRequestHandler):
         return str(modality_info.get("status", "")).strip().lower() == "ready"
 
     def do_GET(self) -> None:
-        logging.info("request GET %s", self.path)
+        if self.path == "/health":
+            Handler._health_log_counter += 1
+            if Handler._health_log_counter % 30 == 1:
+                logging.info("request GET %s", self.path)
+            else:
+                logging.debug("request GET %s", self.path)
+        else:
+            logging.info("request GET %s", self.path)
         if self.path == "/health":
             STARTUP_MANAGER.ensure_started()
             readiness = STARTUP_MANAGER.snapshot()
