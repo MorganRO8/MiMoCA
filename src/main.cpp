@@ -272,7 +272,7 @@ bool SendHttpRequest(const std::string& host,
                      int port,
                      const std::string& request,
                      std::string& response_out,
-                     int timeout_ms = 1200);
+                     int timeout_ms = 5000);
 
 #ifdef _WIN32
 class TtsController {
@@ -2135,7 +2135,7 @@ bool RequestMockPlanner(const std::string& host, int port, const TurnContext& tu
         std::to_string(body.size()) + "\r\n\r\n" + body;
 
     std::string response;
-    if (!SendHttpRequest(host, port, request, response)) {
+    if (!SendHttpRequest(host, port, request, response, 15000)) {
         return false;
     }
 
@@ -3435,17 +3435,28 @@ class MainWindow : public QMainWindow {
         }
     }
 
+    bool IsSidecarTransportLive() const {
+        return sidecar_ok_ && latest_sidecar_health_.reachable && latest_sidecar_health_.alive;
+    }
+
     void SubmitInferenceFrameIfDue(const std::chrono::steady_clock::time_point now) {
-        if (!sidecar_ok_ || (!app_config_.gesture_enabled && !app_config_.vision_enabled)) {
+        if (!IsSidecarTransportLive() || (!app_config_.gesture_enabled && !app_config_.vision_enabled)) {
             return;
         }
 
+        const auto gesture_it = latest_sidecar_health_.modalities.find("gesture");
+        const bool gesture_ready = gesture_it == latest_sidecar_health_.modalities.end() || gesture_it->second.status == "ready";
+        const auto vision_it = latest_sidecar_health_.modalities.find("vision");
+        const bool vision_ready = vision_it == latest_sidecar_health_.modalities.end() || vision_it->second.status == "ready";
+
         const bool should_sample_gesture =
             app_config_.gesture_enabled &&
+            gesture_ready &&
             (!last_gesture_submit_at_.has_value() ||
              now - *last_gesture_submit_at_ >= std::chrono::milliseconds(kGestureSampleIntervalMs));
         const bool should_sample_vision =
             app_config_.vision_enabled &&
+            vision_ready &&
             (!last_vision_submit_at_.has_value() ||
              now - *last_vision_submit_at_ >= std::chrono::milliseconds(kVisionSampleIntervalMs));
         if (!should_sample_gesture && !should_sample_vision) {
@@ -4207,7 +4218,7 @@ class MainWindow : public QMainWindow {
     }
 
     void MaybeProcessGestureIntent(const std::chrono::steady_clock::time_point now) {
-        if (!sidecar_ok_ || !app_config_.gesture_enabled) {
+        if (!IsSidecarTransportLive() || !app_config_.gesture_enabled) {
             gesture_status_text_ = "offline";
             return;
         }
@@ -4394,7 +4405,7 @@ class MainWindow : public QMainWindow {
         }
         mic_status_->setText(mic_label.c_str());
         tts_status_->setText(std::string("tts: ").append(tts_.IsSpeaking() ? "speaking" : "idle").c_str());
-        const bool transport_live = latest_sidecar_health_.reachable && latest_sidecar_health_.alive;
+        const bool transport_live = IsSidecarTransportLive();
         std::string gesture_label = "gesture: ";
         if (!sidecar_ok_ || !transport_live) {
             gesture_label += "offline";
