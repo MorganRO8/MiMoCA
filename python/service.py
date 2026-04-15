@@ -610,21 +610,37 @@ class MediaPipeGestureAdapter:
 
         label = "none"
         heuristic_confidence = 0.15
-        if extended_count >= 4:
+        if extended_count == 5 and pinch_ratio > 0.52:
             label = "next"
-            heuristic_confidence = 0.9
-        elif index_extended and middle_extended and not ring_extended and not pinky_extended:
+            heuristic_confidence = 0.92
+        elif (
+            index_extended
+            and middle_extended
+            and not ring_extended
+            and not pinky_extended
+            and not thumb_extended
+            and pinch_ratio > 0.45
+        ):
             label = "option_b"
-            heuristic_confidence = 0.82
-        elif index_extended and not middle_extended and not ring_extended and not pinky_extended:
+            heuristic_confidence = 0.86
+        elif (
+            index_extended
+            and not middle_extended
+            and not ring_extended
+            and not pinky_extended
+            and not thumb_extended
+            and pinch_ratio > 0.5
+        ):
             label = "option_a"
-            heuristic_confidence = 0.78
-        elif pinch_ratio < 0.35:
+            heuristic_confidence = 0.88
+        elif pinch_ratio < 0.28 and not middle_extended and not ring_extended and not pinky_extended:
             label = "repeat"
-            heuristic_confidence = 0.75
+            heuristic_confidence = 0.86
 
         confidence = max(0.0, min(1.0, (0.55 * detection_score) + (0.45 * heuristic_confidence)))
-        if label in self.ACTION_MIN_CONFIDENCE and confidence < self.ACTION_MIN_CONFIDENCE[label]:
+        if label in self.ACTION_MIN_CONFIDENCE and (
+            detection_score < 0.72 or confidence < self.ACTION_MIN_CONFIDENCE[label]
+        ):
             label = "none"
             confidence = 0.0
         return {

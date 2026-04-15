@@ -3593,12 +3593,12 @@ class MainWindow : public QMainWindow {
         sidecar_health_ready_ = health.ready_for_turns;
         if (!health.reachable || !health.alive) {
             ++sidecar_transport_failure_streak_;
-            std::ostringstream detail;
-            detail << "sidecar unreachable";
-            if (sidecar_transport_failure_streak_ >= 3) {
-                detail << " (transport failures: " << sidecar_transport_failure_streak_ << ")";
-            }
-            MaybePublishSidecarStartupError(detail.str());
+            sidecar_health_ready_ = false;
+            sidecar_startup_error_ =
+                "sidecar unreachable (transport failures: " + std::to_string(sidecar_transport_failure_streak_) + ")";
+            const std::string chat_error =
+                sidecar_transport_failure_streak_ >= 3 ? "sidecar unreachable (transport instability)" : "sidecar unreachable";
+            MaybePublishSidecarStartupError(chat_error);
             return;
         }
         sidecar_transport_failure_streak_ = 0;
@@ -4394,8 +4394,9 @@ class MainWindow : public QMainWindow {
         }
         mic_status_->setText(mic_label.c_str());
         tts_status_->setText(std::string("tts: ").append(tts_.IsSpeaking() ? "speaking" : "idle").c_str());
+        const bool transport_live = latest_sidecar_health_.reachable && latest_sidecar_health_.alive;
         std::string gesture_label = "gesture: ";
-        if (!sidecar_ok_) {
+        if (!sidecar_ok_ || !transport_live) {
             gesture_label += "offline";
         } else if (!app_config_.gesture_enabled) {
             gesture_label += "disabled";
@@ -4418,7 +4419,7 @@ class MainWindow : public QMainWindow {
         }
         gesture_status_->setText(gesture_label.c_str());
         std::string planner_label = "planner: ";
-        if (!sidecar_ok_) {
+        if (!sidecar_ok_ || !transport_live) {
             planner_label += "offline fallback";
         } else if (planner_fallback_active_) {
             planner_label += "fallback active";
@@ -4431,7 +4432,7 @@ class MainWindow : public QMainWindow {
         }
         planner_status_->setText(planner_label.c_str());
         std::string sidecar_label = "sidecar: ";
-        if (!sidecar_ok_) {
+        if (!sidecar_ok_ || !transport_live) {
             if (app_config_.warmup_status == "skipped" || app_config_.warmup_status == "failed" ||
                 app_config_.warmup_status == "downloading" || app_config_.warmup_status == "pending") {
                 sidecar_label += "models still downloading";
